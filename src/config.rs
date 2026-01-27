@@ -83,6 +83,10 @@ pub struct ProxyConfig {
     /// Upstream authentication configuration
     pub upstream_auth: UpstreamAuthConfig,
 
+    /// Custom headers to add to upstream requests
+    #[serde(default)]
+    pub upstream_headers: Vec<(String, String)>,
+
     /// Logging configuration (optional)
     #[serde(default)]
     pub logging: LoggingConfig,

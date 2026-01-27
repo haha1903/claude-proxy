@@ -127,6 +127,10 @@ struct Args {
     /// HTTP port for ACME HTTP-01 challenges (default: 80)
     #[arg(long, value_name = "PORT")]
     http_challenge_port: Option<u16>,
+
+    /// Custom headers to add to upstream requests (can be specified multiple times)
+    #[arg(short = 'H', long = "header", value_name = "KEY=VALUE", action = clap::ArgAction::Append)]
+    headers: Option<Vec<String>>,
 }
 
 #[tokio::main]
@@ -225,6 +229,7 @@ fn build_proxy_router(config: &ProxyConfig) -> Router {
         upstream_url: config.upstream_url.clone(),
         upstream_auth,
         http_client,
+        upstream_headers: config.upstream_headers.clone(),
     };
 
     // Create API key validator state
@@ -599,12 +604,20 @@ fn build_config(
     let file_tls = file_config.as_ref().map(|fc| fc.tls.clone());
     let tls = build_tls_config(args, file_tls)?;
 
+    // Parse CLI headers and merge with file config headers
+    let file_upstream_headers = file_config
+        .as_ref()
+        .map(|fc| fc.upstream_headers.clone())
+        .unwrap_or_default();
+    let upstream_headers = parse_cli_headers(&args.headers, file_upstream_headers);
+
     Ok(ProxyConfig {
         bind_address,
         port,
         upstream_url,
         client_api_key,
         upstream_auth,
+        upstream_headers,
         logging,
         tls,
     })
@@ -817,6 +830,30 @@ fn parse_log_level(s: &str) -> Option<LogLevel> {
         "error" => Some(LogLevel::Error),
         _ => None,
     }
+}
+
+/// Parse CLI headers and merge with file config headers.
+/// CLI headers take precedence over file config headers for the same key.
+fn parse_cli_headers(
+    cli_headers: &Option<Vec<String>>,
+    file_headers: Vec<(String, String)>,
+) -> Vec<(String, String)> {
+    let mut result = file_headers;
+
+    if let Some(headers) = cli_headers {
+        for header in headers {
+            if let Some((key, value)) = header.split_once('=') {
+                let key = key.trim().to_string();
+                let value = value.trim().to_string();
+
+                // Remove any existing header with the same key (case-insensitive)
+                result.retain(|(k, _)| !k.eq_ignore_ascii_case(&key));
+                result.push((key, value));
+            }
+        }
+    }
+
+    result
 }
 
 /// Build TLS config from CLI args, env vars, and file config

@@ -21,6 +21,7 @@ pub struct ProxyState {
     pub upstream_url: String,
     pub upstream_auth: Arc<dyn UpstreamAuth>,
     pub http_client: reqwest::Client,
+    pub upstream_headers: Vec<(String, String)>,
 }
 
 /// Headers that should not be forwarded to the upstream
@@ -166,6 +167,17 @@ pub async fn proxy_handler(
             if !should_strip_header(&name_str) {
                 upstream_headers.insert(name.clone(), value.clone());
             }
+        }
+    }
+
+    // Add custom upstream headers
+    for (name, value) in &state.upstream_headers {
+        if let (Ok(header_name), Ok(header_value)) = (
+            HeaderName::try_from(name.as_str()),
+            HeaderValue::from_str(value),
+        ) {
+            debug!("Adding custom header: {}: {}", name, value);
+            upstream_headers.insert(header_name, header_value);
         }
     }
 

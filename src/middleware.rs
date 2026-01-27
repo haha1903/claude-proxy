@@ -24,10 +24,11 @@ pub async fn validate_client_api_key(
     next: Next,
 ) -> Result<Response, StatusCode> {
     // Extract API key from request headers
-    // Support both x-api-key header and Authorization: Bearer token
+    // Support both api-key / x-api-key header and Authorization: Bearer token
     let api_key = request
         .headers()
-        .get("x-api-key")
+        .get("api-key")
+        .or(request.headers().get("x-api-key"))
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string())
         .or_else(|| {

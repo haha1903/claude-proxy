@@ -400,7 +400,9 @@ async fn forward_buffered_request(
     if auth_header_name == "x-api-key" {
         let bearer_value = format!("Bearer {}", auth_header.to_str().unwrap_or(""));
         if let Ok(hv) = HeaderValue::from_str(&bearer_value) {
-            headers.entry(HeaderName::from_static("authorization")).or_insert(hv);
+            headers
+                .entry(HeaderName::from_static("authorization"))
+                .or_insert(hv);
         }
     }
 

@@ -63,10 +63,7 @@ pub async fn search_brave(
     }
 
     let data: BraveSearchResponse = response.json().await?;
-    let mut results: Vec<BraveWebResult> = data
-        .web
-        .map(|w| w.results)
-        .unwrap_or_default();
+    let mut results: Vec<BraveWebResult> = data.web.map(|w| w.results).unwrap_or_default();
 
     // Filter by allowed domains
     if let Some(ref allowed) = params.allowed_domains {
@@ -75,9 +72,7 @@ pub async fn search_brave(
                 url::Url::parse(&r.url)
                     .ok()
                     .and_then(|u| u.host_str().map(String::from))
-                    .is_some_and(|hostname| {
-                        allowed.iter().any(|d| hostname.contains(d.as_str()))
-                    })
+                    .is_some_and(|hostname| allowed.iter().any(|d| hostname.contains(d.as_str())))
             });
         }
     }
@@ -89,9 +84,7 @@ pub async fn search_brave(
                 url::Url::parse(&r.url)
                     .ok()
                     .and_then(|u| u.host_str().map(String::from))
-                    .is_none_or(|hostname| {
-                        !blocked.iter().any(|d| hostname.contains(d.as_str()))
-                    })
+                    .is_none_or(|hostname| !blocked.iter().any(|d| hostname.contains(d.as_str())))
             });
         }
     }

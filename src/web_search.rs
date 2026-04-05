@@ -115,9 +115,7 @@ pub fn preprocess_web_search(
 
 /// Generate a server tool use ID like the Anthropic API format.
 fn generate_search_id() -> String {
-    let uuid = uuid::Uuid::new_v4()
-        .to_string()
-        .replace('-', "");
+    let uuid = uuid::Uuid::new_v4().to_string().replace('-', "");
     format!("srvtoolu_{}", &uuid[..24])
 }
 
@@ -133,8 +131,12 @@ async fn execute_web_search(
     let params = BraveSearchParams {
         query: query.to_string(),
         count: Some(5),
-        allowed_domains: server_tool.as_ref().and_then(|st| st.allowed_domains.clone()),
-        blocked_domains: server_tool.as_ref().and_then(|st| st.blocked_domains.clone()),
+        allowed_domains: server_tool
+            .as_ref()
+            .and_then(|st| st.allowed_domains.clone()),
+        blocked_domains: server_tool
+            .as_ref()
+            .and_then(|st| st.blocked_domains.clone()),
     };
 
     let results = match search_brave(http_client, api_key, &params).await {
@@ -292,9 +294,10 @@ async fn send_to_upstream(
 
     // Add custom upstream headers
     for (name, value) in upstream_headers {
-        if let (Ok(header_name), Ok(header_value)) =
-            (HeaderName::try_from(name.as_str()), HeaderValue::from_str(value))
-        {
+        if let (Ok(header_name), Ok(header_value)) = (
+            HeaderName::try_from(name.as_str()),
+            HeaderValue::from_str(value),
+        ) {
             headers.insert(header_name, header_value);
         }
     }
@@ -467,8 +470,7 @@ pub async fn handle_non_streaming(
         })?;
 
     // Prepend server_tool_use and web_search_tool_result blocks
-    let server_tool_use_block: ContentBlock =
-        serde_json::from_value(server_tool_use).unwrap();
+    let server_tool_use_block: ContentBlock = serde_json::from_value(server_tool_use).unwrap();
     let tool_result_block: ContentBlock = serde_json::from_value(tool_result).unwrap();
 
     let mut new_content = vec![server_tool_use_block, tool_result_block];
@@ -541,7 +543,10 @@ pub async fn handle_streaming(
     let buffered = buffer_sse_stream(upstream_response).await;
 
     // Check if the model called __web_search
-    let web_search_call = buffered.tool_calls.iter().find(|tc| tc.name == WEB_SEARCH_FUNCTION_NAME);
+    let web_search_call = buffered
+        .tool_calls
+        .iter()
+        .find(|tc| tc.name == WEB_SEARCH_FUNCTION_NAME);
 
     let Some(web_search_call) = web_search_call else {
         // No web search - replay buffered events as SSE
@@ -562,7 +567,8 @@ pub async fn handle_streaming(
         execute_web_search(http_client, brave_api_key, &query, &context.server_tool).await;
 
     // Build continuation payload
-    let tool_call_input: Value = serde_json::from_str(&tool_call_arguments).unwrap_or(json!({"query": query}));
+    let tool_call_input: Value =
+        serde_json::from_str(&tool_call_arguments).unwrap_or(json!({"query": query}));
     let mut continuation = build_continuation_payload(
         payload,
         &tool_call_id,
@@ -619,7 +625,10 @@ pub async fn handle_streaming(
                 }
             }
         });
-        if emit_sse_event(&tx, "message_start", &message_start).await.is_err() {
+        if emit_sse_event(&tx, "message_start", &message_start)
+            .await
+            .is_err()
+        {
             return;
         }
 
@@ -648,7 +657,10 @@ pub async fn handle_streaming(
         block_index += 1;
 
         // 3. Emit web_search_tool_result block (full content in start, no delta)
-        if emit_search_result_block(&tx, block_index, &tool_result).await.is_err() {
+        if emit_search_result_block(&tx, block_index, &tool_result)
+            .await
+            .is_err()
+        {
             return;
         }
         block_index += 1;
@@ -701,12 +713,14 @@ pub async fn handle_streaming(
                                 let mut rewritten = event.clone();
                                 rewritten["index"] = json!(block_index);
                                 text_block_open = true;
-                                let _ = emit_sse_event(&tx, "content_block_start", &rewritten).await;
+                                let _ =
+                                    emit_sse_event(&tx, "content_block_start", &rewritten).await;
                             }
                             "content_block_delta" => {
                                 let mut rewritten = event.clone();
                                 rewritten["index"] = json!(block_index);
-                                let _ = emit_sse_event(&tx, "content_block_delta", &rewritten).await;
+                                let _ =
+                                    emit_sse_event(&tx, "content_block_delta", &rewritten).await;
                             }
                             "content_block_stop" => {
                                 let _ = emit_sse_event(
@@ -944,10 +958,9 @@ async fn buffer_sse_stream(response: reqwest::Response) -> BufferedStreamRespons
                                 let block_type =
                                     block.get("type").and_then(|t| t.as_str()).unwrap_or("");
                                 if block_type == "tool_use" {
-                                    let index = event
-                                        .get("index")
-                                        .and_then(|i| i.as_u64())
-                                        .unwrap_or(0) as usize;
+                                    let index =
+                                        event.get("index").and_then(|i| i.as_u64()).unwrap_or(0)
+                                            as usize;
                                     let id = block
                                         .get("id")
                                         .and_then(|v| v.as_str())
@@ -970,10 +983,8 @@ async fn buffer_sse_stream(response: reqwest::Response) -> BufferedStreamRespons
                             }
                         }
                         "content_block_delta" => {
-                            let index = event
-                                .get("index")
-                                .and_then(|i| i.as_u64())
-                                .unwrap_or(0) as usize;
+                            let index =
+                                event.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
                             if let Some(tc) = tool_call_map.get_mut(&index) {
                                 if let Some(delta) = event.get("delta") {
                                     if let Some(partial) =

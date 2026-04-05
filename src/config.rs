@@ -94,6 +94,10 @@ pub struct ProxyConfig {
     /// TLS configuration (optional, defaults to disabled)
     #[serde(default)]
     pub tls: TlsConfig,
+
+    /// Web search configuration (optional)
+    #[serde(default)]
+    pub web_search: WebSearchConfig,
 }
 
 /// Log rotation frequency
@@ -187,6 +191,23 @@ pub enum UpstreamAuthConfig {
         #[serde(default = "default_azure_scope")]
         resource: String,
     },
+}
+
+/// Web search configuration
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct WebSearchConfig {
+    /// Brave Search API key (supports env var expansion: `${VAR}` or `$VAR`)
+    #[serde(default, deserialize_with = "deserialize_option_env_string")]
+    pub brave_api_key: Option<String>,
+}
+
+/// Deserialize an optional string with environment variable expansion.
+fn deserialize_option_env_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let opt: Option<String> = Option::deserialize(deserializer)?;
+    Ok(opt.map(|s| expand_env_vars(&s)).filter(|s| !s.is_empty()))
 }
 
 fn default_bind_address() -> String {

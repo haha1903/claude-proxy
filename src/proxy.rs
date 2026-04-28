@@ -1,7 +1,7 @@
 use axum::{
     body::Body,
     extract::State,
-    http::{Request, Response, StatusCode},
+    http::{header, Request, Response, StatusCode},
     response::IntoResponse,
 };
 use bytes::Bytes;
@@ -9,8 +9,9 @@ use futures::StreamExt;
 use http_body_util::BodyStream;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use std::sync::Arc;
+use tokio::sync::RwLock;
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::auth::UpstreamAuth;
 use crate::middleware::ClientAuthenticated;
@@ -20,8 +21,31 @@ use crate::middleware::ClientAuthenticated;
 pub struct ProxyState {
     pub upstream_url: String,
     pub upstream_auth: Arc<dyn UpstreamAuth>,
-    pub http_client: reqwest::Client,
+    pub http_client: Arc<RwLock<reqwest::Client>>,
     pub upstream_headers: Vec<(String, String)>,
+}
+
+/// Build a reqwest client for upstream requests.
+pub fn build_http_client() -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder().build()
+}
+
+impl ProxyState {
+    async fn http_client(&self) -> reqwest::Client {
+        self.http_client.read().await.clone()
+    }
+
+    async fn rotate_http_client(&self) {
+        match build_http_client() {
+            Ok(new_client) => {
+                *self.http_client.write().await = new_client;
+                warn!("Replaced upstream HTTP client after upstream 500 response");
+            }
+            Err(e) => {
+                error!("Failed to replace upstream HTTP client: {}", e);
+            }
+        }
+    }
 }
 
 /// Headers that should not be forwarded to the upstream
@@ -65,8 +89,9 @@ pub async fn proxy_handler(
     let uri = request.uri().clone();
     let path = uri.path();
     let query = uri.query().map(|q| format!("?{}", q)).unwrap_or_default();
+    let request_target = format!("{}{}", path, query);
 
-    info!("Proxying {} {}{}", method, path, query);
+    info!("Proxying {} {}", method, request_target);
 
     // Log request details at debug level
     debug!("Request headers:");
@@ -81,7 +106,7 @@ pub async fn proxy_handler(
     }
 
     // Build the upstream URL
-    let upstream_url = format!("{}{}{}", state.upstream_url, path, query);
+    let upstream_url = format!("{}{}", state.upstream_url, request_target);
 
     // Check if the client is authenticated
     let client_authenticated = request
@@ -199,9 +224,9 @@ pub async fn proxy_handler(
     }));
 
     // Build and send the upstream request
-    let upstream_request = state
-        .http_client
-        .request(method, &upstream_url)
+    let http_client = state.http_client().await;
+    let upstream_request = http_client
+        .request(method.clone(), &upstream_url)
         .headers(upstream_headers)
         .body(reqwest_body);
 
@@ -222,6 +247,22 @@ pub async fn proxy_handler(
         info!("Upstream response: {} {}", status.as_u16(), reason);
     } else {
         info!("Upstream response: {}", status.as_u16());
+    }
+
+    if status == StatusCode::INTERNAL_SERVER_ERROR {
+        warn!(
+            "Upstream returned 500 for {} {}; converting to 429, dropping upstream response body, rotating upstream HTTP client, and closing downstream connection",
+            method, request_target
+        );
+        drop(upstream_response);
+        drop(http_client);
+        state.rotate_http_client().await;
+
+        return Response::builder()
+            .status(StatusCode::TOO_MANY_REQUESTS)
+            .header(header::CONNECTION, HeaderValue::from_static("close"))
+            .body(Body::empty())
+            .unwrap();
     }
 
     let mut response_headers = HeaderMap::new();

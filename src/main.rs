@@ -8,6 +8,8 @@ mod tls;
 use axum::{middleware as axum_middleware, routing::any, Router};
 use clap::Parser;
 use std::net::SocketAddr;
+use std::sync::Arc;
+use tokio::sync::RwLock;
 use tower_http::trace::TraceLayer;
 use tracing::{info, Level};
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
@@ -18,7 +20,7 @@ use crate::config::{
     LogLevel, LogRotation, LoggingConfig, ProxyConfig, TlsConfig, UpstreamAuthConfig,
 };
 use crate::middleware::{validate_client_api_key, ApiKeyValidatorState};
-use crate::proxy::{proxy_handler, ProxyState};
+use crate::proxy::{build_http_client, proxy_handler, ProxyState};
 
 /// Claude API Proxy - A proxy server for the Claude API with multiple authentication backends
 #[derive(Parser, Debug)]
@@ -220,15 +222,13 @@ fn build_proxy_router(config: &ProxyConfig) -> Router {
     let upstream_auth = create_upstream_auth(&config.upstream_auth);
 
     // Create HTTP client for upstream requests
-    let http_client = reqwest::Client::builder()
-        .build()
-        .expect("Failed to create HTTP client");
+    let http_client = build_http_client().expect("Failed to create HTTP client");
 
     // Create proxy state
     let proxy_state = ProxyState {
         upstream_url: config.upstream_url.clone(),
         upstream_auth,
-        http_client,
+        http_client: Arc::new(RwLock::new(http_client)),
         upstream_headers: config.upstream_headers.clone(),
     };
 

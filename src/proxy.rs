@@ -80,6 +80,8 @@ fn should_strip_header(name: &str) -> bool {
 /// Authentication-related headers
 const AUTH_HEADERS: &[&str] = &["authorization", "api-key", "x-api-key"];
 
+const UPSTREAM_500_RETRY_AFTER_SECS: &str = "30";
+
 /// Proxy handler that forwards requests to the Claude API
 pub async fn proxy_handler(
     State(state): State<ProxyState>,
@@ -261,6 +263,10 @@ pub async fn proxy_handler(
         return Response::builder()
             .status(StatusCode::TOO_MANY_REQUESTS)
             .header(header::CONNECTION, HeaderValue::from_static("close"))
+            .header(
+                header::RETRY_AFTER,
+                HeaderValue::from_static(UPSTREAM_500_RETRY_AFTER_SECS),
+            )
             .body(Body::empty())
             .unwrap();
     }
@@ -301,4 +307,68 @@ pub async fn proxy_handler(
     *response.status_mut() = status;
     *response.headers_mut() = response_headers;
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::AuthError;
+    use async_trait::async_trait;
+    use axum::Router;
+    use http_body_util::BodyExt;
+    use std::net::SocketAddr;
+    use tokio::net::TcpListener;
+
+    struct UnusedAuth;
+
+    #[async_trait]
+    impl UpstreamAuth for UnusedAuth {
+        async fn get_auth_header(&self) -> Result<HeaderValue, AuthError> {
+            Ok(HeaderValue::from_static("unused"))
+        }
+    }
+
+    async fn spawn_upstream_500() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let app = Router::new()
+            .fallback(|| async { (StatusCode::INTERNAL_SERVER_ERROR, "upstream internal error") });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        (addr, handle)
+    }
+
+    #[tokio::test]
+    async fn upstream_500_is_converted_to_429_with_retry_after() {
+        let (addr, upstream_server) = spawn_upstream_500().await;
+        let state = ProxyState {
+            upstream_url: format!("http://{}", addr),
+            upstream_auth: Arc::new(UnusedAuth),
+            http_client: Arc::new(RwLock::new(build_http_client().unwrap())),
+            upstream_headers: vec![],
+        };
+        let request = Request::builder()
+            .uri("/v1/messages")
+            .body(Body::empty())
+            .unwrap();
+
+        let mut response = proxy_handler(State(state), request).await.into_response();
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            response.headers().get(header::RETRY_AFTER),
+            Some(&HeaderValue::from_static(UPSTREAM_500_RETRY_AFTER_SECS))
+        );
+        assert_eq!(
+            response.headers().get(header::CONNECTION),
+            Some(&HeaderValue::from_static("close"))
+        );
+
+        let body = response.body_mut().collect().await.unwrap().to_bytes();
+        assert!(body.is_empty());
+
+        upstream_server.abort();
+    }
 }

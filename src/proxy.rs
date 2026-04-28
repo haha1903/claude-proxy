@@ -9,6 +9,7 @@ use futures::StreamExt;
 use http_body_util::BodyStream;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, error, info, warn};
@@ -80,7 +81,7 @@ fn should_strip_header(name: &str) -> bool {
 /// Authentication-related headers
 const AUTH_HEADERS: &[&str] = &["authorization", "api-key", "x-api-key"];
 
-const UPSTREAM_500_RETRY_AFTER_SECS: &str = "30";
+const UPSTREAM_500_RESPONSE_DELAY_SECS: u64 = 30;
 
 /// Proxy handler that forwards requests to the Claude API
 pub async fn proxy_handler(
@@ -253,20 +254,17 @@ pub async fn proxy_handler(
 
     if status == StatusCode::INTERNAL_SERVER_ERROR {
         warn!(
-            "Upstream returned 500 for {} {}; converting to 429, dropping upstream response body, rotating upstream HTTP client, and closing downstream connection",
-            method, request_target
+            "Upstream returned 500 for {} {}; dropping upstream response body, rotating upstream HTTP client, delaying {} seconds, returning 503, and closing downstream connection",
+            method, request_target, UPSTREAM_500_RESPONSE_DELAY_SECS
         );
         drop(upstream_response);
         drop(http_client);
         state.rotate_http_client().await;
+        tokio::time::sleep(Duration::from_secs(UPSTREAM_500_RESPONSE_DELAY_SECS)).await;
 
         return Response::builder()
-            .status(StatusCode::TOO_MANY_REQUESTS)
+            .status(StatusCode::SERVICE_UNAVAILABLE)
             .header(header::CONNECTION, HeaderValue::from_static("close"))
-            .header(
-                header::RETRY_AFTER,
-                HeaderValue::from_static(UPSTREAM_500_RETRY_AFTER_SECS),
-            )
             .body(Body::empty())
             .unwrap();
     }
@@ -340,8 +338,8 @@ mod tests {
         (addr, handle)
     }
 
-    #[tokio::test]
-    async fn upstream_500_is_converted_to_429_with_retry_after() {
+    #[tokio::test(start_paused = true)]
+    async fn upstream_500_is_delayed_then_converted_to_503() {
         let (addr, upstream_server) = spawn_upstream_500().await;
         let state = ProxyState {
             upstream_url: format!("http://{}", addr),
@@ -354,13 +352,19 @@ mod tests {
             .body(Body::empty())
             .unwrap();
 
-        let mut response = proxy_handler(State(state), request).await.into_response();
+        let response_task =
+            tokio::spawn(async move { proxy_handler(State(state), request).await.into_response() });
 
-        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(
-            response.headers().get(header::RETRY_AFTER),
-            Some(&HeaderValue::from_static(UPSTREAM_500_RETRY_AFTER_SECS))
-        );
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(UPSTREAM_500_RESPONSE_DELAY_SECS - 1)).await;
+        tokio::task::yield_now().await;
+        assert!(!response_task.is_finished());
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let mut response = response_task.await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(response.headers().get(header::RETRY_AFTER).is_none());
         assert_eq!(
             response.headers().get(header::CONNECTION),
             Some(&HeaderValue::from_static("close"))

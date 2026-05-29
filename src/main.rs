@@ -1,12 +1,9 @@
 mod acme;
-mod anthropic_types;
 mod auth;
-mod brave_search;
 mod config;
 mod middleware;
 mod proxy;
 mod tls;
-mod web_search;
 
 use axum::{middleware as axum_middleware, routing::any, Router};
 use clap::Parser;
@@ -136,10 +133,6 @@ struct Args {
     /// Custom headers to add to upstream requests (can be specified multiple times)
     #[arg(short = 'H', long = "header", value_name = "KEY=VALUE", action = clap::ArgAction::Append)]
     headers: Option<Vec<String>>,
-
-    /// Brave Search API key for web search support
-    #[arg(long, value_name = "KEY")]
-    brave_api_key: Option<String>,
 }
 
 #[tokio::main]
@@ -169,9 +162,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Starting Claude API Proxy");
     info!("Upstream URL: {}", config.upstream_url);
-    if config.web_search.brave_api_key.is_some() {
-        info!("Web search enabled (Brave Search API)");
-    }
 
     // Build the main proxy router
     let app = build_proxy_router(&config);
@@ -240,7 +230,6 @@ fn build_proxy_router(config: &ProxyConfig) -> Router {
         upstream_auth,
         http_client: Arc::new(RwLock::new(http_client)),
         upstream_headers: config.upstream_headers.clone(),
-        brave_api_key: config.web_search.brave_api_key.clone(),
     };
 
     // Create API key validator state
@@ -626,17 +615,6 @@ fn build_config(
         .unwrap_or_default();
     let upstream_headers = parse_cli_headers(&args.headers, file_upstream_headers);
 
-    // Build web search config
-    let file_brave_api_key = file_config
-        .as_ref()
-        .and_then(|fc| fc.web_search.brave_api_key.clone());
-    let brave_api_key = get_optional_value(
-        args.brave_api_key.clone(),
-        "CLAUDE_PROXY__WEB_SEARCH__BRAVE_API_KEY",
-        file_brave_api_key,
-    );
-    let web_search = config::WebSearchConfig { brave_api_key };
-
     Ok(ProxyConfig {
         bind_address,
         port,
@@ -646,7 +624,6 @@ fn build_config(
         upstream_headers,
         logging,
         tls,
-        web_search,
     })
 }
 

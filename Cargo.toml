@@ -41,6 +41,7 @@ instant-acme = { version = "0.7", default-features = false, features = ["hyper-r
 rcgen = { version = "0.13", default-features = false, features = ["pem", "ring"] }
 
 [dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
 toml = "0.9"
 
 [profile.release]

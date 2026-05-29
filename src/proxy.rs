@@ -1,7 +1,7 @@
 use axum::{
     body::Body,
     extract::State,
-    http::{Request, Response, StatusCode},
+    http::{header, Request, Response, StatusCode},
     response::IntoResponse,
 };
 use bytes::Bytes;
@@ -9,8 +9,10 @@ use futures::StreamExt;
 use http_body_util::BodyStream;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::RwLock;
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::auth::UpstreamAuth;
 use crate::middleware::ClientAuthenticated;
@@ -20,9 +22,32 @@ use crate::middleware::ClientAuthenticated;
 pub struct ProxyState {
     pub upstream_url: String,
     pub upstream_auth: Arc<dyn UpstreamAuth>,
-    pub http_client: reqwest::Client,
+    pub http_client: Arc<RwLock<reqwest::Client>>,
     pub upstream_headers: Vec<(String, String)>,
     pub brave_api_key: Option<String>,
+}
+
+/// Build a reqwest client for upstream requests.
+pub fn build_http_client() -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder().build()
+}
+
+impl ProxyState {
+    async fn http_client(&self) -> reqwest::Client {
+        self.http_client.read().await.clone()
+    }
+
+    async fn rotate_http_client(&self) {
+        match build_http_client() {
+            Ok(new_client) => {
+                *self.http_client.write().await = new_client;
+                warn!("Replaced upstream HTTP client after upstream 500 response");
+            }
+            Err(e) => {
+                error!("Failed to replace upstream HTTP client: {}", e);
+            }
+        }
+    }
 }
 
 /// Headers that should not be forwarded to the upstream
@@ -57,6 +82,8 @@ fn should_strip_header(name: &str) -> bool {
 /// Authentication-related headers
 const AUTH_HEADERS: &[&str] = &["authorization", "api-key", "x-api-key"];
 
+const UPSTREAM_500_RESPONSE_DELAY_SECS: u64 = 30;
+
 /// Proxy handler that forwards requests to the Claude API
 pub async fn proxy_handler(
     State(state): State<ProxyState>,
@@ -66,8 +93,9 @@ pub async fn proxy_handler(
     let uri = request.uri().clone();
     let path = uri.path();
     let query = uri.query().map(|q| format!("?{}", q)).unwrap_or_default();
+    let request_target = format!("{}{}", path, query);
 
-    info!("Proxying {} {}{}", method, path, query);
+    info!("Proxying {} {}", method, request_target);
 
     // Log request details at debug level
     debug!("Request headers:");
@@ -82,7 +110,7 @@ pub async fn proxy_handler(
     }
 
     // Build the upstream URL
-    let upstream_url = format!("{}{}{}", state.upstream_url, path, query);
+    let upstream_url = format!("{}{}", state.upstream_url, request_target);
 
     // Check if the client is authenticated
     let client_authenticated = request
@@ -213,9 +241,9 @@ pub async fn proxy_handler(
     }));
 
     // Build and send the upstream request
-    let upstream_request = state
-        .http_client
-        .request(method, &upstream_url)
+    let http_client = state.http_client().await;
+    let upstream_request = http_client
+        .request(method.clone(), &upstream_url)
         .headers(upstream_headers)
         .body(reqwest_body);
 
@@ -236,6 +264,23 @@ pub async fn proxy_handler(
         info!("Upstream response: {} {}", status.as_u16(), reason);
     } else {
         info!("Upstream response: {}", status.as_u16());
+    }
+
+    if status == StatusCode::INTERNAL_SERVER_ERROR {
+        warn!(
+            "Upstream returned 500 for {} {}; dropping upstream response body, rotating upstream HTTP client, delaying {} seconds, returning 503, and closing downstream connection",
+            method, request_target, UPSTREAM_500_RESPONSE_DELAY_SECS
+        );
+        drop(upstream_response);
+        drop(http_client);
+        state.rotate_http_client().await;
+        tokio::time::sleep(Duration::from_secs(UPSTREAM_500_RESPONSE_DELAY_SECS)).await;
+
+        return Response::builder()
+            .status(StatusCode::SERVICE_UNAVAILABLE)
+            .header(header::CONNECTION, HeaderValue::from_static("close"))
+            .body(Body::empty())
+            .unwrap();
     }
 
     let mut response_headers = HeaderMap::new();
@@ -328,6 +373,7 @@ async fn handle_messages_with_web_search(
     }
 
     let is_streaming = modified_payload.stream.unwrap_or(false);
+    let http_client = state.http_client().await;
 
     let result = if is_streaming {
         crate::web_search::handle_streaming(
@@ -336,7 +382,7 @@ async fn handle_messages_with_web_search(
             &state.upstream_url,
             &state.upstream_auth,
             &state.upstream_headers,
-            &state.http_client,
+            &http_client,
             brave_api_key,
         )
         .await
@@ -347,7 +393,7 @@ async fn handle_messages_with_web_search(
             &state.upstream_url,
             &state.upstream_auth,
             &state.upstream_headers,
-            &state.http_client,
+            &http_client,
             brave_api_key,
         )
         .await
@@ -415,8 +461,8 @@ async fn forward_buffered_request(
         }
     }
 
-    let upstream_request = state
-        .http_client
+    let http_client = state.http_client().await;
+    let upstream_request = http_client
         .post(&upstream_url)
         .headers(headers)
         .body(body_bytes.to_vec());
@@ -467,4 +513,75 @@ async fn forward_buffered_request(
     *response.status_mut() = status;
     *response.headers_mut() = response_headers;
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::AuthError;
+    use async_trait::async_trait;
+    use axum::Router;
+    use http_body_util::BodyExt;
+    use std::net::SocketAddr;
+    use tokio::net::TcpListener;
+
+    struct UnusedAuth;
+
+    #[async_trait]
+    impl UpstreamAuth for UnusedAuth {
+        async fn get_auth_header(&self) -> Result<HeaderValue, AuthError> {
+            Ok(HeaderValue::from_static("unused"))
+        }
+    }
+
+    async fn spawn_upstream_500() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let app = Router::new()
+            .fallback(|| async { (StatusCode::INTERNAL_SERVER_ERROR, "upstream internal error") });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        (addr, handle)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn upstream_500_is_delayed_then_converted_to_503() {
+        let (addr, upstream_server) = spawn_upstream_500().await;
+        let state = ProxyState {
+            upstream_url: format!("http://{}", addr),
+            upstream_auth: Arc::new(UnusedAuth),
+            http_client: Arc::new(RwLock::new(build_http_client().unwrap())),
+            upstream_headers: vec![],
+            brave_api_key: None,
+        };
+        let request = Request::builder()
+            .uri("/v1/messages")
+            .body(Body::empty())
+            .unwrap();
+
+        let response_task =
+            tokio::spawn(async move { proxy_handler(State(state), request).await.into_response() });
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(UPSTREAM_500_RESPONSE_DELAY_SECS - 1)).await;
+        tokio::task::yield_now().await;
+        assert!(!response_task.is_finished());
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let mut response = response_task.await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(response.headers().get(header::RETRY_AFTER).is_none());
+        assert_eq!(
+            response.headers().get(header::CONNECTION),
+            Some(&HeaderValue::from_static("close"))
+        );
+
+        let body = response.body_mut().collect().await.unwrap().to_bytes();
+        assert!(body.is_empty());
+
+        upstream_server.abort();
+    }
 }

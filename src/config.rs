@@ -156,6 +156,12 @@ pub enum UpstreamAuthConfig {
         #[serde(deserialize_with = "deserialize_env_string")]
         api_key: String,
     },
+    /// Static bearer token authentication - sends `Authorization: Bearer <token>`
+    Bearer {
+        /// The bearer token (supports env var expansion: `${VAR}` or `$VAR`)
+        #[serde(deserialize_with = "deserialize_env_string")]
+        token: String,
+    },
     /// Azure AD (Entra ID) authentication with client secret
     AzureAd {
         /// Azure AD tenant ID (supports env var expansion: `${VAR}` or `$VAR`)
@@ -431,6 +437,29 @@ mod tests {
         }
 
         env::remove_var("TEST_API_KEY");
+    }
+
+    #[test]
+    fn test_deserialize_bearer_with_env_var() {
+        env::set_var("TEST_BEARER_TOKEN", "my-bearer-token");
+
+        let toml_str = r#"
+            client_api_key = "proxy-key"
+            [upstream_auth]
+            type = "bearer"
+            token = "${TEST_BEARER_TOKEN}"
+        "#;
+
+        let config: ProxyConfig = toml::from_str(toml_str).unwrap();
+
+        match config.upstream_auth {
+            UpstreamAuthConfig::Bearer { token } => {
+                assert_eq!(token, "my-bearer-token");
+            }
+            _ => panic!("Expected Bearer config"),
+        }
+
+        env::remove_var("TEST_BEARER_TOKEN");
     }
 
     #[test]

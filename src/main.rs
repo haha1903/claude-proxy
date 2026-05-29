@@ -52,13 +52,17 @@ struct Args {
     client_api_key: Option<String>,
 
     // Upstream auth settings
-    /// Upstream authentication type: api_key, azure_ad, azure_cli, azure_managed_identity
+    /// Upstream authentication type: api_key, bearer, azure_ad, azure_cli, azure_managed_identity
     #[arg(long, value_name = "TYPE")]
     upstream_auth_type: Option<String>,
 
     /// API key for upstream authentication (when type=api_key)
     #[arg(long, value_name = "KEY")]
     upstream_api_key: Option<String>,
+
+    /// Bearer token for upstream authentication (when type=bearer)
+    #[arg(long, value_name = "TOKEN")]
+    upstream_bearer_token: Option<String>,
 
     /// Azure AD tenant ID (when type=azure_ad)
     #[arg(long, value_name = "ID")]
@@ -658,6 +662,19 @@ fn build_upstream_auth(
 
             Ok(UpstreamAuthConfig::ApiKey { api_key })
         }
+        "bearer" => {
+            let token = get_optional_value(
+                args.upstream_bearer_token.clone(),
+                "CLAUDE_PROXY__UPSTREAM_AUTH__TOKEN",
+                match &file_auth {
+                    Some(UpstreamAuthConfig::Bearer { token }) => Some(token.clone()),
+                    _ => None,
+                },
+            )
+            .ok_or("upstream_auth.token is required for bearer auth type. Set via --upstream-bearer-token, CLAUDE_PROXY__UPSTREAM_AUTH__TOKEN, or config file.")?;
+
+            Ok(UpstreamAuthConfig::Bearer { token })
+        }
         "azure_ad" => {
             let tenant_id = get_optional_value(
                 args.azure_tenant_id.clone(),
@@ -748,7 +765,7 @@ fn build_upstream_auth(
             Ok(UpstreamAuthConfig::AzureManagedIdentity { client_id, resource })
         }
         _ => Err(format!(
-            "Unknown upstream_auth.type: '{}'. Valid types: api_key, azure_ad, azure_cli, azure_managed_identity",
+            "Unknown upstream_auth.type: '{}'. Valid types: api_key, bearer, azure_ad, azure_cli, azure_managed_identity",
             auth_type
         )
         .into()),
@@ -759,6 +776,7 @@ fn build_upstream_auth(
 fn auth_type_name(auth: &UpstreamAuthConfig) -> &'static str {
     match auth {
         UpstreamAuthConfig::ApiKey { .. } => "api_key",
+        UpstreamAuthConfig::Bearer { .. } => "bearer",
         UpstreamAuthConfig::AzureAd { .. } => "azure_ad",
         UpstreamAuthConfig::AzureCli { .. } => "azure_cli",
         UpstreamAuthConfig::AzureManagedIdentity { .. } => "azure_managed_identity",

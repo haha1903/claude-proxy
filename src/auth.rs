@@ -56,6 +56,30 @@ impl UpstreamAuth for ApiKeyAuth {
     }
 }
 
+/// Bearer token authentication - uses a static token sent as `Authorization: Bearer <token>`
+pub struct BearerAuth {
+    token: String,
+}
+
+impl BearerAuth {
+    pub fn new(token: String) -> Self {
+        Self { token }
+    }
+}
+
+#[async_trait]
+impl UpstreamAuth for BearerAuth {
+    async fn get_auth_header(&self) -> Result<HeaderValue, AuthError> {
+        let header_value = format!("Bearer {}", self.token);
+        HeaderValue::from_str(&header_value)
+            .map_err(|e| AuthError::Config(format!("Invalid token format: {}", e)))
+    }
+
+    fn auth_header_name(&self) -> &'static str {
+        "authorization"
+    }
+}
+
 /// Azure AD (Entra ID) authentication with token caching
 pub struct AzureAdAuth {
     tenant_id: String,
@@ -589,6 +613,7 @@ impl UpstreamAuth for AzureManagedIdentityAuth {
 pub fn create_upstream_auth(config: &UpstreamAuthConfig) -> Arc<dyn UpstreamAuth> {
     match config {
         UpstreamAuthConfig::ApiKey { api_key } => Arc::new(ApiKeyAuth::new(api_key.clone())),
+        UpstreamAuthConfig::Bearer { token } => Arc::new(BearerAuth::new(token.clone())),
         UpstreamAuthConfig::AzureAd {
             tenant_id,
             client_id,

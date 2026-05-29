@@ -88,7 +88,14 @@ type = "api_key"
 api_key = "sk-..."
 ```
 
-**Option 2: Azure AD** (Microsoft AI Foundry only)
+**Option 2: Bearer Token** (sends `Authorization: Bearer <token>`)
+```toml
+[upstream_auth]
+type = "bearer"
+token = "${UPSTREAM_BEARER_TOKEN}"
+```
+
+**Option 3: Azure AD** (Microsoft AI Foundry only)
 ```toml
 [upstream_auth]
 type = "azure_ad"
@@ -98,14 +105,14 @@ client_secret = "${AZURE_CLIENT_SECRET}"
 scope = "https://ai.azure.com/.default"
 ```
 
-**Option 3: Azure CLI** (Microsoft AI Foundry only)
+**Option 4: Azure CLI** (Microsoft AI Foundry only)
 ```toml
 [upstream_auth]
 type = "azure_cli"
 scope = "https://ai.azure.com/.default"
 ```
 
-**Option 4: Azure Managed Identity** (Microsoft AI Foundry only)
+**Option 5: Azure Managed Identity** (Microsoft AI Foundry only)
 ```toml
 [upstream_auth]
 type = "azure_managed_identity"
@@ -219,8 +226,9 @@ All configuration can also be specified via CLI flags or environment variables. 
 
 | CLI Flag | Environment Variable | Description |
 |----------|---------------------|-------------|
-| `--upstream-auth-type <TYPE>` | `CLAUDE_PROXY__UPSTREAM_AUTH__TYPE` | Auth type: `api_key`, `azure_ad`, `azure_cli`, `azure_managed_identity` |
+| `--upstream-auth-type <TYPE>` | `CLAUDE_PROXY__UPSTREAM_AUTH__TYPE` | Auth type: `api_key`, `bearer`, `azure_ad`, `azure_cli`, `azure_managed_identity` |
 | `--upstream-api-key <KEY>` | `CLAUDE_PROXY__UPSTREAM_AUTH__API_KEY` | API key (when type=`api_key`) |
+| `--upstream-bearer-token <TOKEN>` | `CLAUDE_PROXY__UPSTREAM_AUTH__TOKEN` | Bearer token (when type=`bearer`) |
 | `--azure-tenant-id <ID>` | `CLAUDE_PROXY__UPSTREAM_AUTH__TENANT_ID` | Azure AD tenant ID (when type=`azure_ad`) |
 | `--azure-client-id <ID>` | `CLAUDE_PROXY__UPSTREAM_AUTH__CLIENT_ID` | Azure AD/managed identity client ID |
 | `--azure-client-secret <SECRET>` | `CLAUDE_PROXY__UPSTREAM_AUTH__CLIENT_SECRET` | Azure AD client secret (when type=`azure_ad`) |

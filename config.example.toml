@@ -60,6 +60,16 @@ api_key = "${UPSTREAM_API_KEY}"
 # # Default resource for Microsoft AI Foundry, no need to change
 # resource = "https://ai.azure.com/.default"
 
+# Web search emulation (optional)
+# When at least one provider key is set, the proxy intercepts authenticated
+# /v1/messages requests whose ONLY tool is `web_search`, runs the search itself,
+# and returns Anthropic-format results without calling the upstream model.
+# If this section is omitted (or no key is set), the proxy is a pure passthrough.
+# With both keys set, providers are used round-robin with failover.
+# [web_search]
+# brave_api_key = "${BRAVE_API_KEY}"
+# tavily_api_key = "${TAVILY_API_KEY}"
+
 # Logging configuration (optional)
 # If this section is omitted, logs are written to stdout only at INFO level
 [logging]

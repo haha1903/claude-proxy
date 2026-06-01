@@ -11,6 +11,16 @@ where
     Ok(expand_env_vars(&s))
 }
 
+/// Deserialize an optional string that may contain environment variable
+/// references. Expands `${VAR}`/`$VAR`; an empty result becomes `None`.
+fn deserialize_option_env_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let opt: Option<String> = Option::deserialize(deserializer)?;
+    Ok(opt.map(|s| expand_env_vars(&s)).filter(|s| !s.is_empty()))
+}
+
 /// Expand environment variables in a string.
 /// Supports both `${VAR_NAME}` and `$VAR_NAME` syntax.
 fn expand_env_vars(s: &str) -> String {
@@ -94,6 +104,24 @@ pub struct ProxyConfig {
     /// TLS configuration (optional, defaults to disabled)
     #[serde(default)]
     pub tls: TlsConfig,
+
+    /// Web search configuration (optional)
+    #[serde(default)]
+    pub web_search: WebSearchConfig,
+}
+
+/// Web search emulation configuration. When at least one provider API key is
+/// set, the proxy intercepts web-search-only Messages requests and serves them
+/// itself instead of forwarding to the upstream.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct WebSearchConfig {
+    /// Brave Search API key (supports env var expansion: `${VAR}` or `$VAR`)
+    #[serde(default, deserialize_with = "deserialize_option_env_string")]
+    pub brave_api_key: Option<String>,
+
+    /// Tavily Search API key (supports env var expansion: `${VAR}` or `$VAR`)
+    #[serde(default, deserialize_with = "deserialize_option_env_string")]
+    pub tavily_api_key: Option<String>,
 }
 
 /// Log rotation frequency
@@ -460,6 +488,44 @@ mod tests {
         }
 
         env::remove_var("TEST_BEARER_TOKEN");
+    }
+
+    #[test]
+    fn test_deserialize_web_search_keys_with_env_var() {
+        env::set_var("TEST_BRAVE_KEY", "brave-123");
+
+        let toml_str = r#"
+            client_api_key = "proxy-key"
+            [upstream_auth]
+            type = "api_key"
+            api_key = "sk-test"
+            [web_search]
+            brave_api_key = "${TEST_BRAVE_KEY}"
+            tavily_api_key = ""
+        "#;
+
+        let config: ProxyConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            config.web_search.brave_api_key.as_deref(),
+            Some("brave-123")
+        );
+        // empty string is normalized to None
+        assert_eq!(config.web_search.tavily_api_key, None);
+
+        env::remove_var("TEST_BRAVE_KEY");
+    }
+
+    #[test]
+    fn test_web_search_defaults_to_none() {
+        let toml_str = r#"
+            client_api_key = "proxy-key"
+            [upstream_auth]
+            type = "api_key"
+            api_key = "sk-test"
+        "#;
+        let config: ProxyConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.web_search.brave_api_key, None);
+        assert_eq!(config.web_search.tavily_api_key, None);
     }
 
     #[test]

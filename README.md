@@ -14,6 +14,7 @@ The proxy does byte-to-byte forwarding of requests and responses, with the excep
   - Azure Managed Identity for Azure-hosted workloads
 - Client API key validation with passthrough mode for unauthenticated requests
 - Streaming (SSE) response support
+- Web search emulation for upstreams that lack the Anthropic `web_search` server tool (Brave / Tavily)
 - Configurable logging with file rotation
 - TLS/HTTPS support with manual certificates or automatic ACME (Let's Encrypt)
 
@@ -150,6 +151,33 @@ When using Microsoft AI Foundry, make sure to set the API base URL to include `/
 
 For example, an OpenAI client should set the base URL to `http://<proxy-ip:port>/openai`.
 
+### Web Search Emulation
+
+Some upstreams (e.g. models served via Microsoft AI Foundry) do not support the
+Anthropic `web_search` server tool. When a Brave and/or Tavily API key is
+configured, the proxy intercepts authenticated `/v1/messages` requests **whose
+only tool is `web_search`**, performs the search itself, and returns results in
+Anthropic's format (`server_tool_use` + `web_search_tool_result` + a text
+summary) — without calling the upstream model. Both streaming and non-streaming
+responses are supported.
+
+```toml
+[web_search]
+brave_api_key = "${BRAVE_API_KEY}"    # optional
+tavily_api_key = "${TAVILY_API_KEY}"  # optional
+```
+
+- **Enable switch**: configuring at least one key turns the feature on. If
+  neither is set, the proxy stays a pure passthrough (no request-body parsing).
+- **Multiple providers**: when both keys are set, requests are load-balanced
+  round-robin and fail over to the other provider on error.
+- Requests with any other tool, or with `web_search` alongside other tools, are
+  forwarded to the upstream unchanged.
+
+Keys can also be supplied via CLI flags (`--brave-api-key`, `--tavily-api-key`)
+or environment variables (`CLAUDE_PROXY__WEB_SEARCH__BRAVE_API_KEY`,
+`CLAUDE_PROXY__WEB_SEARCH__TAVILY_API_KEY`).
+
 ### Logging Configuration
 
 ```toml
@@ -243,6 +271,13 @@ All configuration can also be specified via CLI flags or environment variables. 
 | `--log-rotation <ROTATION>` | `CLAUDE_PROXY__LOGGING__ROTATION` | Log rotation: `hourly`, `daily` | `daily` |
 | `--log-level <LEVEL>` | `CLAUDE_PROXY__LOGGING__LEVEL` | Log level: `trace`, `debug`, `info`, `warn`, `error` | `info` |
 | `--log-prefix <PREFIX>` | `CLAUDE_PROXY__LOGGING__LOG_PREFIX` | Prefix for log file names | `claude-proxy` |
+
+#### Web Search Options
+
+| CLI Flag | Environment Variable | Description | Default |
+|----------|---------------------|-------------|---------|
+| `--brave-api-key <KEY>` | `CLAUDE_PROXY__WEB_SEARCH__BRAVE_API_KEY` | Brave Search API key (enables web search emulation) | - |
+| `--tavily-api-key <KEY>` | `CLAUDE_PROXY__WEB_SEARCH__TAVILY_API_KEY` | Tavily Search API key (enables web search emulation) | - |
 
 #### TLS Options
 

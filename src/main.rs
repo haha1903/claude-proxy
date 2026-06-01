@@ -4,6 +4,8 @@ mod config;
 mod middleware;
 mod proxy;
 mod tls;
+mod web_search_emulation;
+mod websearch;
 
 use axum::{middleware as axum_middleware, routing::any, Router};
 use clap::Parser;
@@ -18,9 +20,11 @@ use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, Lay
 use crate::auth::create_upstream_auth;
 use crate::config::{
     LogLevel, LogRotation, LoggingConfig, ProxyConfig, TlsConfig, UpstreamAuthConfig,
+    WebSearchConfig,
 };
 use crate::middleware::{validate_client_api_key, ApiKeyValidatorState};
 use crate::proxy::{build_http_client, proxy_handler, ProxyState};
+use crate::websearch::{BraveProvider, SearchProvider, TavilyProvider, WebSearchManager};
 
 /// Claude API Proxy - A proxy server for the Claude API with multiple authentication backends
 #[derive(Parser, Debug)]
@@ -137,6 +141,14 @@ struct Args {
     /// Custom headers to add to upstream requests (can be specified multiple times)
     #[arg(short = 'H', long = "header", value_name = "KEY=VALUE", action = clap::ArgAction::Append)]
     headers: Option<Vec<String>>,
+
+    /// Brave Search API key (enables web search emulation)
+    #[arg(long, value_name = "KEY")]
+    brave_api_key: Option<String>,
+
+    /// Tavily Search API key (enables web search emulation)
+    #[arg(long, value_name = "KEY")]
+    tavily_api_key: Option<String>,
 }
 
 #[tokio::main]
@@ -166,6 +178,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Starting Claude API Proxy");
     info!("Upstream URL: {}", config.upstream_url);
+    if config.web_search.brave_api_key.is_some() || config.web_search.tavily_api_key.is_some() {
+        info!("Web search emulation enabled");
+    }
 
     // Build the main proxy router
     let app = build_proxy_router(&config);
@@ -228,12 +243,19 @@ fn build_proxy_router(config: &ProxyConfig) -> Router {
     // Create HTTP client for upstream requests
     let http_client = build_http_client().expect("Failed to create HTTP client");
 
+    // Build the web search manager (None when no provider keys are configured)
+    let web_search = build_web_search_manager(&config.web_search);
+    if let Some(ref mgr) = web_search {
+        info!("Web search emulation providers: {}", mgr.provider_names());
+    }
+
     // Create proxy state
     let proxy_state = ProxyState {
         upstream_url: config.upstream_url.clone(),
         upstream_auth,
         http_client: Arc::new(RwLock::new(http_client)),
         upstream_headers: config.upstream_headers.clone(),
+        web_search,
     };
 
     // Create API key validator state
@@ -251,6 +273,29 @@ fn build_proxy_router(config: &ProxyConfig) -> Router {
         ))
         .layer(TraceLayer::new_for_http())
         .with_state(proxy_state)
+}
+
+/// Build a web search manager from configured provider keys, or `None` if no
+/// keys are set. Providers are added in a fixed order (Brave, then Tavily) so
+/// round-robin starts deterministically.
+fn build_web_search_manager(config: &WebSearchConfig) -> Option<Arc<WebSearchManager>> {
+    let search_client = reqwest::Client::new();
+    let mut providers: Vec<Arc<dyn SearchProvider>> = Vec::new();
+
+    if let Some(ref key) = config.brave_api_key {
+        providers.push(Arc::new(BraveProvider::new(
+            key.clone(),
+            search_client.clone(),
+        )));
+    }
+    if let Some(ref key) = config.tavily_api_key {
+        providers.push(Arc::new(TavilyProvider::new(
+            key.clone(),
+            search_client.clone(),
+        )));
+    }
+
+    WebSearchManager::new(providers).map(Arc::new)
 }
 
 /// Start plain HTTP server (existing behavior when TLS is disabled)
@@ -619,6 +664,27 @@ fn build_config(
         .unwrap_or_default();
     let upstream_headers = parse_cli_headers(&args.headers, file_upstream_headers);
 
+    // Build web search config: CLI > env > file
+    let file_web_search = file_config.as_ref().map(|fc| fc.web_search.clone());
+    let brave_api_key = get_optional_value(
+        args.brave_api_key.clone(),
+        "CLAUDE_PROXY__WEB_SEARCH__BRAVE_API_KEY",
+        file_web_search
+            .as_ref()
+            .and_then(|w| w.brave_api_key.clone()),
+    );
+    let tavily_api_key = get_optional_value(
+        args.tavily_api_key.clone(),
+        "CLAUDE_PROXY__WEB_SEARCH__TAVILY_API_KEY",
+        file_web_search
+            .as_ref()
+            .and_then(|w| w.tavily_api_key.clone()),
+    );
+    let web_search = WebSearchConfig {
+        brave_api_key,
+        tavily_api_key,
+    };
+
     Ok(ProxyConfig {
         bind_address,
         port,
@@ -628,6 +694,7 @@ fn build_config(
         upstream_headers,
         logging,
         tls,
+        web_search,
     })
 }
 

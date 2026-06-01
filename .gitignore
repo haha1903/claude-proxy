@@ -2,5 +2,7 @@
 /test
 config.toml
 CLAUDE.md
+AGENTS.md
+hint.md
 .claude
 .env*

@@ -16,6 +16,8 @@ use tracing::{debug, error, info, warn};
 
 use crate::auth::UpstreamAuth;
 use crate::middleware::ClientAuthenticated;
+use crate::web_search_emulation;
+use crate::websearch::WebSearchManager;
 
 /// Shared state for the proxy
 #[derive(Clone)]
@@ -24,6 +26,8 @@ pub struct ProxyState {
     pub upstream_auth: Arc<dyn UpstreamAuth>,
     pub http_client: Arc<RwLock<reqwest::Client>>,
     pub upstream_headers: Vec<(String, String)>,
+    /// Web search manager; `None` disables emulation (pure passthrough).
+    pub web_search: Option<Arc<WebSearchManager>>,
 }
 
 /// Build a reqwest client for upstream requests.
@@ -217,6 +221,25 @@ pub async fn proxy_handler(
         );
     }
 
+    // Web search emulation: only for authenticated /v1/messages when a manager
+    // is configured. The body must be buffered to inspect the tools, so this
+    // branch is entered only when web search is enabled — the default path below
+    // keeps streaming without buffering.
+    if client_authenticated && path == "/v1/messages" {
+        if let Some(web_search) = state.web_search.clone() {
+            return handle_messages_with_web_search(
+                &state,
+                web_search,
+                request,
+                method,
+                &upstream_url,
+                &request_target,
+                upstream_headers,
+            )
+            .await;
+        }
+    }
+
     // Stream the request body directly to upstream without buffering
     let request_body = request.into_body();
     let body_stream = BodyStream::new(request_body);
@@ -233,6 +256,27 @@ pub async fn proxy_handler(
         .headers(upstream_headers)
         .body(reqwest_body);
 
+    relay_upstream(
+        &state,
+        &method,
+        &request_target,
+        http_client,
+        upstream_request,
+    )
+    .await
+}
+
+/// Send an upstream request and relay its response back to the client,
+/// streaming the body. Applies the upstream-500 → 503 back-off behavior.
+/// Shared by the streaming passthrough path and the buffered web-search-forward
+/// path so both have identical upstream semantics.
+async fn relay_upstream(
+    state: &ProxyState,
+    method: &reqwest::Method,
+    request_target: &str,
+    http_client: reqwest::Client,
+    upstream_request: reqwest::RequestBuilder,
+) -> Response<Body> {
     let upstream_response = match upstream_request.send().await {
         Ok(response) => response,
         Err(e) => {
@@ -307,6 +351,55 @@ pub async fn proxy_handler(
     response
 }
 
+/// Handle an authenticated `/v1/messages` request when web search is enabled.
+/// Buffers the body to inspect tools: if it is a web-search-only request, serve
+/// it via emulation; otherwise forward the buffered body to the upstream as-is.
+async fn handle_messages_with_web_search(
+    state: &ProxyState,
+    web_search: Arc<WebSearchManager>,
+    request: Request<Body>,
+    method: reqwest::Method,
+    upstream_url: &str,
+    request_target: &str,
+    upstream_headers: HeaderMap,
+) -> Response<Body> {
+    use http_body_util::BodyExt;
+
+    // Buffer the entire request body so we can inspect it.
+    let body_bytes = match request.into_body().collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(e) => {
+            error!("Failed to read request body: {}", e);
+            return Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(Body::from(format!("Failed to read request body: {}", e)))
+                .unwrap();
+        }
+    };
+
+    if web_search_emulation::is_only_web_search_request(&body_bytes) {
+        debug!("Intercepting web-search-only request for emulation");
+        return web_search_emulation::handle(&web_search, &body_bytes).await;
+    }
+
+    // Not a web-search request — forward the buffered body unchanged.
+    debug!("Not a web-search-only request, forwarding buffered body to upstream");
+    let http_client = state.http_client().await;
+    let upstream_request = http_client
+        .request(method.clone(), upstream_url)
+        .headers(upstream_headers)
+        .body(body_bytes.to_vec());
+
+    relay_upstream(
+        state,
+        &method,
+        request_target,
+        http_client,
+        upstream_request,
+    )
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -346,6 +439,7 @@ mod tests {
             upstream_auth: Arc::new(UnusedAuth),
             http_client: Arc::new(RwLock::new(build_http_client().unwrap())),
             upstream_headers: vec![],
+            web_search: None,
         };
         let request = Request::builder()
             .uri("/v1/messages")

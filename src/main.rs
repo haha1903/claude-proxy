@@ -52,13 +52,17 @@ struct Args {
     client_api_key: Option<String>,
 
     // Upstream auth settings
-    /// Upstream authentication type: api_key, azure_ad, azure_cli, azure_managed_identity
+    /// Upstream authentication type: api_key, bearer, azure_ad, azure_cli, azure_managed_identity
     #[arg(long, value_name = "TYPE")]
     upstream_auth_type: Option<String>,
 
     /// API key for upstream authentication (when type=api_key)
     #[arg(long, value_name = "KEY")]
     upstream_api_key: Option<String>,
+
+    /// Bearer token for upstream authentication (when type=bearer)
+    #[arg(long, value_name = "TOKEN")]
+    upstream_bearer_token: Option<String>,
 
     /// Azure AD tenant ID (when type=azure_ad)
     #[arg(long, value_name = "ID")]
@@ -492,13 +496,35 @@ fn load_config_file(
     Ok(None)
 }
 
+/// Trait for parsing environment variable values to target types.
+trait FromEnvStr: Sized {
+    fn from_env_str(value: &str) -> Option<Self>;
+}
+
+impl FromEnvStr for String {
+    fn from_env_str(value: &str) -> Option<Self> {
+        Some(value.to_string())
+    }
+}
+
+impl FromEnvStr for u16 {
+    fn from_env_str(value: &str) -> Option<Self> {
+        value.parse().ok()
+    }
+}
+
 /// Get value with precedence: CLI > env > file > default
-fn get_value<T: Clone + 'static>(cli: Option<T>, env_var: &str, file: Option<T>, default: T) -> T {
+fn get_value<T: Clone + FromEnvStr>(
+    cli: Option<T>,
+    env_var: &str,
+    file: Option<T>,
+    default: T,
+) -> T {
     if let Some(v) = cli {
         return v;
     }
     if let Ok(v) = std::env::var(env_var) {
-        if let Some(parsed) = parse_env_value::<T>(&v) {
+        if let Some(parsed) = T::from_env_str(&v) {
             return parsed;
         }
     }
@@ -506,7 +532,7 @@ fn get_value<T: Clone + 'static>(cli: Option<T>, env_var: &str, file: Option<T>,
 }
 
 /// Get optional value with precedence: CLI > env > file
-fn get_optional_value<T: Clone + 'static>(
+fn get_optional_value<T: Clone + FromEnvStr>(
     cli: Option<T>,
     env_var: &str,
     file: Option<T>,
@@ -515,29 +541,11 @@ fn get_optional_value<T: Clone + 'static>(
         return cli;
     }
     if let Ok(v) = std::env::var(env_var) {
-        if let Some(parsed) = parse_env_value::<T>(&v) {
+        if let Some(parsed) = T::from_env_str(&v) {
             return Some(parsed);
         }
     }
     file
-}
-
-/// Parse environment variable value to target type
-fn parse_env_value<T: 'static>(value: &str) -> Option<T> {
-    use std::any::TypeId;
-
-    // This is a bit hacky but works for our use case
-    if TypeId::of::<T>() == TypeId::of::<String>() {
-        // SAFETY: We just checked T is String
-        Some(unsafe { std::mem::transmute_copy(&value.to_string()) })
-    } else if TypeId::of::<T>() == TypeId::of::<u16>() {
-        value.parse::<u16>().ok().map(|v| {
-            // SAFETY: We just checked T is u16
-            unsafe { std::mem::transmute_copy(&v) }
-        })
-    } else {
-        None
-    }
 }
 
 /// Build the final config by merging CLI args, env vars, file config, and defaults
@@ -654,6 +662,19 @@ fn build_upstream_auth(
 
             Ok(UpstreamAuthConfig::ApiKey { api_key })
         }
+        "bearer" => {
+            let token = get_optional_value(
+                args.upstream_bearer_token.clone(),
+                "CLAUDE_PROXY__UPSTREAM_AUTH__TOKEN",
+                match &file_auth {
+                    Some(UpstreamAuthConfig::Bearer { token }) => Some(token.clone()),
+                    _ => None,
+                },
+            )
+            .ok_or("upstream_auth.token is required for bearer auth type. Set via --upstream-bearer-token, CLAUDE_PROXY__UPSTREAM_AUTH__TOKEN, or config file.")?;
+
+            Ok(UpstreamAuthConfig::Bearer { token })
+        }
         "azure_ad" => {
             let tenant_id = get_optional_value(
                 args.azure_tenant_id.clone(),
@@ -744,7 +765,7 @@ fn build_upstream_auth(
             Ok(UpstreamAuthConfig::AzureManagedIdentity { client_id, resource })
         }
         _ => Err(format!(
-            "Unknown upstream_auth.type: '{}'. Valid types: api_key, azure_ad, azure_cli, azure_managed_identity",
+            "Unknown upstream_auth.type: '{}'. Valid types: api_key, bearer, azure_ad, azure_cli, azure_managed_identity",
             auth_type
         )
         .into()),
@@ -755,6 +776,7 @@ fn build_upstream_auth(
 fn auth_type_name(auth: &UpstreamAuthConfig) -> &'static str {
     match auth {
         UpstreamAuthConfig::ApiKey { .. } => "api_key",
+        UpstreamAuthConfig::Bearer { .. } => "bearer",
         UpstreamAuthConfig::AzureAd { .. } => "azure_ad",
         UpstreamAuthConfig::AzureCli { .. } => "azure_cli",
         UpstreamAuthConfig::AzureManagedIdentity { .. } => "azure_managed_identity",

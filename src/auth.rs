@@ -192,6 +192,113 @@ impl UpstreamAuth for AzureAdAuth {
     }
 }
 
+/// GitHub Copilot authentication.
+///
+/// Takes a long-lived GitHub OAuth token (`ghu_...`) and exchanges it for a
+/// short-lived Copilot API token via `copilot_internal/v2/token`, caching and
+/// refreshing it before expiry. The Copilot backend also requires editor
+/// identity headers, returned via `get_additional_headers`.
+pub struct CopilotAuth {
+    github_token: String,
+    http_client: reqwest::Client,
+    cached_token: Arc<RwLock<Option<CachedToken>>>,
+}
+
+#[derive(serde::Deserialize)]
+struct CopilotTokenResponse {
+    token: String,
+    expires_at: i64,
+}
+
+impl CopilotAuth {
+    pub fn new(github_token: String) -> Self {
+        Self {
+            github_token,
+            http_client: reqwest::Client::new(),
+            cached_token: Arc::new(RwLock::new(None)),
+        }
+    }
+
+    async fn fetch_token(&self) -> Result<CachedToken, AuthError> {
+        let response = self
+            .http_client
+            .get("https://api.github.com/copilot_internal/v2/token")
+            .header("authorization", format!("token {}", self.github_token))
+            .header("editor-version", "vscode/1.96.0")
+            .header("user-agent", "GithubCopilot/1.96.0")
+            .header("accept", "application/json")
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let error_text = response.text().await.unwrap_or_default();
+            return Err(AuthError::TokenAcquisition(format!(
+                "Copilot token request failed: {}",
+                error_text
+            )));
+        }
+
+        let token_response: CopilotTokenResponse = response.json().await?;
+
+        // Refresh 60s before the reported expiry to avoid using a stale token.
+        let expires_at = chrono::DateTime::from_timestamp(token_response.expires_at - 60, 0)
+            .unwrap_or_else(chrono::Utc::now);
+
+        Ok(CachedToken {
+            access_token: token_response.token,
+            expires_at,
+        })
+    }
+
+    async fn get_valid_token(&self) -> Result<String, AuthError> {
+        {
+            let cached = self.cached_token.read().await;
+            if let Some(ref token) = *cached {
+                if token.expires_at > chrono::Utc::now() {
+                    return Ok(token.access_token.clone());
+                }
+            }
+        }
+
+        let new_token = self.fetch_token().await?;
+        let access_token = new_token.access_token.clone();
+
+        {
+            let mut cached = self.cached_token.write().await;
+            *cached = Some(new_token);
+        }
+
+        Ok(access_token)
+    }
+}
+
+#[async_trait]
+impl UpstreamAuth for CopilotAuth {
+    async fn get_auth_header(&self) -> Result<HeaderValue, AuthError> {
+        let token = self.get_valid_token().await?;
+        let header_value = format!("Bearer {}", token);
+        HeaderValue::from_str(&header_value)
+            .map_err(|e| AuthError::Config(format!("Invalid token format: {}", e)))
+    }
+
+    fn auth_header_name(&self) -> &'static str {
+        "authorization"
+    }
+
+    async fn get_additional_headers(&self) -> Result<Vec<(String, HeaderValue)>, AuthError> {
+        Ok(vec![
+            (
+                "editor-version".to_string(),
+                HeaderValue::from_static("vscode/1.96.0"),
+            ),
+            (
+                "copilot-integration-id".to_string(),
+                HeaderValue::from_static("vscode-chat"),
+            ),
+        ])
+    }
+}
+
 /// Azure CLI credential authentication - uses `az account get-access-token`
 pub struct AzureCliAuth {
     scope: String,
@@ -614,6 +721,9 @@ pub fn create_upstream_auth(config: &UpstreamAuthConfig) -> Arc<dyn UpstreamAuth
     match config {
         UpstreamAuthConfig::ApiKey { api_key } => Arc::new(ApiKeyAuth::new(api_key.clone())),
         UpstreamAuthConfig::Bearer { token } => Arc::new(BearerAuth::new(token.clone())),
+        UpstreamAuthConfig::Copilot { github_token } => {
+            Arc::new(CopilotAuth::new(github_token.clone()))
+        }
         UpstreamAuthConfig::AzureAd {
             tenant_id,
             client_id,

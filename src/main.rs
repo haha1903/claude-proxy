@@ -68,6 +68,10 @@ struct Args {
     #[arg(long, value_name = "TOKEN")]
     upstream_bearer_token: Option<String>,
 
+    /// GitHub OAuth token for upstream authentication (when type=copilot)
+    #[arg(long, value_name = "TOKEN")]
+    upstream_github_token: Option<String>,
+
     /// Azure AD tenant ID (when type=azure_ad)
     #[arg(long, value_name = "ID")]
     azure_tenant_id: Option<String>,
@@ -742,6 +746,21 @@ fn build_upstream_auth(
 
             Ok(UpstreamAuthConfig::Bearer { token })
         }
+        "copilot" => {
+            let github_token = get_optional_value(
+                args.upstream_github_token.clone(),
+                "CLAUDE_PROXY__UPSTREAM_AUTH__GITHUB_TOKEN",
+                match &file_auth {
+                    Some(UpstreamAuthConfig::Copilot { github_token }) => {
+                        Some(github_token.clone())
+                    }
+                    _ => None,
+                },
+            )
+            .ok_or("upstream_auth.github_token is required for copilot auth type. Set via --upstream-github-token, CLAUDE_PROXY__UPSTREAM_AUTH__GITHUB_TOKEN, or config file.")?;
+
+            Ok(UpstreamAuthConfig::Copilot { github_token })
+        }
         "azure_ad" => {
             let tenant_id = get_optional_value(
                 args.azure_tenant_id.clone(),
@@ -844,6 +863,7 @@ fn auth_type_name(auth: &UpstreamAuthConfig) -> &'static str {
     match auth {
         UpstreamAuthConfig::ApiKey { .. } => "api_key",
         UpstreamAuthConfig::Bearer { .. } => "bearer",
+        UpstreamAuthConfig::Copilot { .. } => "copilot",
         UpstreamAuthConfig::AzureAd { .. } => "azure_ad",
         UpstreamAuthConfig::AzureCli { .. } => "azure_cli",
         UpstreamAuthConfig::AzureManagedIdentity { .. } => "azure_managed_identity",

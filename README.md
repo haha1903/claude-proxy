@@ -9,6 +9,8 @@ The proxy does byte-to-byte forwarding of requests and responses, with the excep
 - Proxy requests to Claude API, OpenAI API, or any model that Microsoft AI Foundry supports
 - Multiple upstream authentication methods:
   - Direct API key passthrough
+  - Static bearer token
+  - GitHub Copilot (exchanges a GitHub OAuth token for a short-lived Copilot token)
   - Azure AD (Entra ID) with client credentials
   - Azure CLI credentials for local development
   - Azure Managed Identity for Azure-hosted workloads
@@ -96,7 +98,20 @@ type = "bearer"
 token = "${UPSTREAM_BEARER_TOKEN}"
 ```
 
-**Option 3: Azure AD** (Microsoft AI Foundry only)
+**Option 3: GitHub Copilot** (use a Copilot subscription as the Claude backend)
+```toml
+upstream_url = "https://api.githubcopilot.com"
+
+[upstream_auth]
+type = "copilot"
+github_token = "${GH_COPILOT_TOKEN}"
+```
+Exchanges the long-lived GitHub OAuth token (`ghu_...`) for a short-lived
+Copilot API token (refreshed automatically before expiry) and sends it as
+`Authorization: Bearer`, along with the editor identity headers Copilot
+requires. Use Copilot model names directly (e.g. `claude-opus-4.8`).
+
+**Option 4: Azure AD** (Microsoft AI Foundry only)
 ```toml
 [upstream_auth]
 type = "azure_ad"
@@ -106,14 +121,14 @@ client_secret = "${AZURE_CLIENT_SECRET}"
 scope = "https://ai.azure.com/.default"
 ```
 
-**Option 4: Azure CLI** (Microsoft AI Foundry only)
+**Option 5: Azure CLI** (Microsoft AI Foundry only)
 ```toml
 [upstream_auth]
 type = "azure_cli"
 scope = "https://ai.azure.com/.default"
 ```
 
-**Option 5: Azure Managed Identity** (Microsoft AI Foundry only)
+**Option 6: Azure Managed Identity** (Microsoft AI Foundry only)
 ```toml
 [upstream_auth]
 type = "azure_managed_identity"

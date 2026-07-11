@@ -190,6 +190,13 @@ pub enum UpstreamAuthConfig {
         #[serde(deserialize_with = "deserialize_env_string")]
         token: String,
     },
+    /// GitHub Copilot authentication - exchanges a GitHub OAuth token for a
+    /// short-lived Copilot API token and sends it as `Authorization: Bearer`
+    Copilot {
+        /// The GitHub OAuth token (`ghu_...`) (supports env var expansion: `${VAR}` or `$VAR`)
+        #[serde(deserialize_with = "deserialize_env_string")]
+        github_token: String,
+    },
     /// Azure AD (Entra ID) authentication with client secret
     AzureAd {
         /// Azure AD tenant ID (supports env var expansion: `${VAR}` or `$VAR`)

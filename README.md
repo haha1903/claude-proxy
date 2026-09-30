@@ -2,7 +2,7 @@
 
 The main purpose of this proxy is to enable using Claude and OpenAI compatible clients with Microsoft AI Foundry, which may use AAD auth and most clients do not support it natively.
 
-The proxy does byte-to-byte forwarding of requests and responses, with the exception of base URL and authentication headers. So it should work with any client that supports Claude or OpenAI APIs, including streaming responses and other extended features.
+The proxy forwards request and response bytes, adjusting the base URL and authentication headers. Optional web search emulation and the Copilot Responses compatibility handling below are the exceptions.
 
 ## Features
 
@@ -110,6 +110,27 @@ Exchanges the long-lived GitHub OAuth token (`ghu_...`) for a short-lived
 Copilot API token (refreshed automatically before expiry) and sends it as
 `Authorization: Bearer`, along with the editor identity headers Copilot
 requires. Use Copilot model names directly (e.g. `claude-opus-4.8`).
+
+For Copilot `POST /responses` and `/v1/responses` SSE responses, the proxy keeps
+the first upstream item ID per `output_index` across streamed events and output
+snapshots. This prevents clients such as Codex from displaying one message twice
+when Copilot rotates opaque IDs. It parses only identity-related JSON fields and
+patches their original byte ranges. Other bytes, including unknown fields,
+tool `call_id`, encrypted state, whitespace and SSE framing, are preserved.
+Requests are still streamed unchanged. Each stream owns its mapping, and only
+one incomplete SSE event is buffered. Unrecognized events pass through. An event
+over 16 MiB switches the remaining stream to passthrough to bound buffering.
+Other upstreams, endpoints and non-SSE responses retain their existing behavior.
+
+This follows the output-index correlation used by
+[Agent Maestro](https://github.com/StudentWan/agent-maestro-desktop/pull/14),
+[ghc-api](https://github.com/sxwxs/ghc-api/pull/52), and
+[Vercel AI SDK](https://github.com/vercel/ai/pull/18548), while avoiding whole-event
+JSON serialization. To measure local event-processing cost:
+
+```bash
+cargo test --release benchmark_event_processing -- --ignored --nocapture
+```
 
 **Option 4: Azure AD** (Microsoft AI Foundry only)
 ```toml

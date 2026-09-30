@@ -1,6 +1,7 @@
 mod acme;
 mod auth;
 mod config;
+mod copilot_responses;
 mod middleware;
 mod proxy;
 mod tls;
@@ -260,6 +261,7 @@ fn build_proxy_router(config: &ProxyConfig) -> Router {
         http_client: Arc::new(RwLock::new(http_client)),
         upstream_headers: config.upstream_headers.clone(),
         web_search,
+        copilot_responses: matches!(config.upstream_auth, UpstreamAuthConfig::Copilot { .. }),
     };
 
     // Create API key validator state

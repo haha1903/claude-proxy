@@ -12,7 +12,7 @@ http-body-util = "0.1"
 # Use ring instead of aws-lc-rs for TLS (better cross-platform support, no cmake dependency)
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls-webpki-roots", "charset", "http2", "rustls-tls-manual-roots-no-provider"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["raw_value"] }
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["trace", "cors"] }
 tracing = "0.1"

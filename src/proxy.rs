@@ -15,6 +15,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, error, info, warn};
 
 use crate::auth::UpstreamAuth;
+use crate::copilot_responses::ResponsesStream;
 use crate::middleware::ClientAuthenticated;
 use crate::web_search_emulation;
 use crate::websearch::WebSearchManager;
@@ -28,6 +29,7 @@ pub struct ProxyState {
     pub upstream_headers: Vec<(String, String)>,
     /// Web search manager; `None` disables emulation (pure passthrough).
     pub web_search: Option<Arc<WebSearchManager>>,
+    pub copilot_responses: bool,
 }
 
 /// Build a reqwest client for upstream requests.
@@ -86,6 +88,14 @@ fn should_strip_header(name: &str) -> bool {
 const AUTH_HEADERS: &[&str] = &["authorization", "api-key", "x-api-key"];
 
 const UPSTREAM_500_RESPONSE_DELAY_SECS: u64 = 30;
+
+fn is_responses_request(method: &reqwest::Method, target: &str) -> bool {
+    method == reqwest::Method::POST
+        && matches!(
+            target.split('?').next(),
+            Some("/responses" | "/v1/responses")
+        )
+}
 
 /// Proxy handler that forwards requests to the Claude API
 pub async fn proxy_handler(
@@ -240,6 +250,13 @@ pub async fn proxy_handler(
         }
     }
 
+    if state.copilot_responses && is_responses_request(&method, &request_target) {
+        upstream_headers.insert(
+            header::ACCEPT_ENCODING,
+            HeaderValue::from_static("identity"),
+        );
+    }
+
     // Stream the request body directly to upstream without buffering
     let request_body = request.into_body();
     let body_stream = BodyStream::new(request_body);
@@ -322,19 +339,76 @@ async fn relay_upstream(
         }
     }
 
-    // Stream all response bodies without buffering
+    let normalize = state.copilot_responses
+        && is_responses_request(method, request_target)
+        && status.is_success()
+        && response_headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| {
+                value
+                    .split(';')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .eq_ignore_ascii_case("text/event-stream")
+            })
+        && response_headers
+            .get(header::CONTENT_ENCODING)
+            .is_none_or(|value| value == "identity");
+    if normalize {
+        for name in [
+            "content-length",
+            "etag",
+            "content-md5",
+            "digest",
+            "content-digest",
+            "repr-digest",
+        ] {
+            response_headers.remove(name);
+        }
+    }
+
+    // Only Copilot Responses buffers individual SSE events for ID normalization.
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(32);
 
     let mut byte_stream = upstream_response.bytes_stream();
     tokio::spawn(async move {
-        while let Some(chunk) = byte_stream.next().await {
+        let mut normalizer = normalize.then(ResponsesStream::default);
+        loop {
+            let chunk = tokio::select! {
+                biased;
+                _ = tx.closed() => break,
+                chunk = byte_stream.next() => chunk,
+            };
+            let Some(chunk) = chunk else {
+                if let Some(normalizer) = &mut normalizer {
+                    let tail = normalizer.finish();
+                    if !tail.is_empty() {
+                        let _ = tx.send(Ok(tail)).await;
+                    }
+                }
+                break;
+            };
             match chunk {
                 Ok(bytes) => {
-                    if tx.send(Ok(bytes)).await.is_err() {
-                        break;
+                    let frames = match &mut normalizer {
+                        Some(normalizer) => normalizer.push(bytes),
+                        None => vec![bytes],
+                    };
+                    for frame in frames {
+                        if tx.send(Ok(frame)).await.is_err() {
+                            return;
+                        }
                     }
                 }
                 Err(e) => {
+                    if let Some(normalizer) = &mut normalizer {
+                        let tail = normalizer.drain();
+                        if !tail.is_empty() {
+                            let _ = tx.send(Ok(tail)).await;
+                        }
+                    }
                     let _ = tx.send(Err(std::io::Error::other(e.to_string()))).await;
                     break;
                 }
@@ -431,6 +505,315 @@ mod tests {
         (addr, handle)
     }
 
+    #[tokio::test]
+    async fn copilot_stream_keeps_one_message_identity() {
+        let source = concat!(
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"first\",\"type\":\"message\"}}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"item_id\":\"second\",\"delta\":\"hello\"}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"third\",\"type\":\"message\"}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"id\":\"fourth\",\"type\":\"message\"}]}}\n\n",
+        );
+        let app = Router::new().fallback(move || async move {
+            ([(header::CONTENT_TYPE, "text/event-stream")], source)
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let state = ProxyState {
+            upstream_url: format!("http://{addr}"),
+            upstream_auth: Arc::new(UnusedAuth),
+            http_client: Arc::new(RwLock::new(build_http_client().unwrap())),
+            upstream_headers: vec![],
+            web_search: None,
+            copilot_responses: true,
+        };
+        let request = Request::builder()
+            .method("POST")
+            .uri("/responses")
+            .body(Body::from("{\"stream\":true}"))
+            .unwrap();
+        let response = proxy_handler(State(state), request).await.into_response();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        server.abort();
+        assert_eq!(
+            body.as_ref(),
+            source
+                .replace("second", "first")
+                .replace("third", "first")
+                .replace("fourth", "first")
+                .as_bytes()
+        );
+    }
+
+    #[tokio::test]
+    async fn normalizer_scope_headers_and_request_bytes_are_preserved() {
+        let cases = [
+            (
+                true,
+                "POST",
+                "/responses?test=1",
+                "text/event-stream; charset=utf-8",
+                200,
+                None,
+                true,
+            ),
+            (
+                true,
+                "POST",
+                "/v1/responses",
+                "TEXT/EVENT-STREAM",
+                200,
+                Some("identity"),
+                true,
+            ),
+            (
+                false,
+                "POST",
+                "/responses",
+                "text/event-stream",
+                200,
+                None,
+                false,
+            ),
+            (
+                true,
+                "GET",
+                "/responses",
+                "text/event-stream",
+                200,
+                None,
+                false,
+            ),
+            (
+                true,
+                "POST",
+                "/v1/messages",
+                "text/event-stream",
+                200,
+                None,
+                false,
+            ),
+            (
+                true,
+                "POST",
+                "/responses",
+                "application/json",
+                200,
+                None,
+                false,
+            ),
+            (
+                true,
+                "POST",
+                "/responses",
+                "text/event-stream",
+                400,
+                None,
+                false,
+            ),
+            (
+                true,
+                "POST",
+                "/responses",
+                "text/event-stream",
+                200,
+                Some("gzip"),
+                false,
+            ),
+        ];
+        for (copilot, method, path, content_type, status, encoding, changed) in cases {
+            let source = concat!(
+                "data: {\"type\":\"response.future\",\"output_index\":0,\"item_id\":\"first\"}\n\n",
+                "data: {\"type\":\"response.future\",\"output_index\":0,\"item_id\":\"later\"}\n\n",
+            );
+            let request_body = if method == "GET" {
+                ""
+            } else {
+                " {\"future\":1.2300e+04} "
+            };
+            let identity = copilot && is_responses_request(&method.parse().unwrap(), path);
+            let app = Router::new().fallback(move |request: Request<Body>| async move {
+                assert_eq!(
+                    request.headers()[header::ACCEPT_ENCODING],
+                    if identity { "identity" } else { "gzip" }
+                );
+                assert_eq!(
+                    request.into_body().collect().await.unwrap().to_bytes(),
+                    request_body
+                );
+                let mut response = Response::builder()
+                    .status(status)
+                    .header(header::CONTENT_TYPE, content_type)
+                    .header(header::CONTENT_LENGTH, source.len())
+                    .header(header::ETAG, "original")
+                    .header("x-request-id", "keep");
+                if let Some(encoding) = encoding {
+                    response = response.header(header::CONTENT_ENCODING, encoding);
+                }
+                response.body(Body::from(source)).unwrap()
+            });
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let state = ProxyState {
+                upstream_url: format!("http://{addr}"),
+                upstream_auth: Arc::new(UnusedAuth),
+                http_client: Arc::new(RwLock::new(build_http_client().unwrap())),
+                upstream_headers: vec![],
+                web_search: None,
+                copilot_responses: copilot,
+            };
+            let request = Request::builder()
+                .method(method)
+                .uri(path)
+                .header(header::ACCEPT_ENCODING, "gzip")
+                .body(Body::from(request_body))
+                .unwrap();
+            let response = proxy_handler(State(state), request).await.into_response();
+            assert_eq!(response.status().as_u16(), status);
+            assert_eq!(response.headers()["x-request-id"], "keep");
+            assert_eq!(
+                response.headers().contains_key(header::CONTENT_LENGTH),
+                !changed
+            );
+            assert_eq!(response.headers().contains_key(header::ETAG), !changed);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(
+                body.as_ref(),
+                if changed {
+                    source.replace("later", "first")
+                } else {
+                    source.to_owned()
+                }
+                .as_bytes()
+            );
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_downstream_cancels_a_stalled_upstream() {
+        struct StalledBody {
+            first: Option<Bytes>,
+            dropped: Arc<tokio::sync::Notify>,
+        }
+        impl futures::Stream for StalledBody {
+            type Item = Result<Bytes, std::io::Error>;
+            fn poll_next(
+                mut self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Option<Self::Item>> {
+                match self.first.take() {
+                    Some(bytes) => std::task::Poll::Ready(Some(Ok(bytes))),
+                    None => std::task::Poll::Pending,
+                }
+            }
+        }
+        impl Drop for StalledBody {
+            fn drop(&mut self) {
+                self.dropped.notify_one();
+            }
+        }
+        let dropped = Arc::new(tokio::sync::Notify::new());
+        let upstream_dropped = dropped.clone();
+        let app = Router::new().fallback(move || {
+            let dropped = upstream_dropped.clone();
+            async move {
+                Response::builder()
+                    .header(header::CONTENT_TYPE, "text/event-stream")
+                    .body(Body::from_stream(StalledBody {
+                        first: Some(Bytes::from_static(b": ready\n\n")),
+                        dropped,
+                    }))
+                    .unwrap()
+            }
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let state = ProxyState {
+            upstream_url: format!("http://{addr}"),
+            upstream_auth: Arc::new(UnusedAuth),
+            http_client: Arc::new(RwLock::new(build_http_client().unwrap())),
+            upstream_headers: vec![],
+            web_search: None,
+            copilot_responses: true,
+        };
+        let request = Request::builder()
+            .method("POST")
+            .uri("/responses")
+            .body(Body::empty())
+            .unwrap();
+        let response = proxy_handler(State(state), request).await.into_response();
+        let mut body = response.into_body();
+        let frame = tokio::time::timeout(Duration::from_secs(2), body.frame())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(frame.into_data().unwrap(), b": ready\n\n".as_slice());
+        drop(body);
+        tokio::time::timeout(Duration::from_secs(2), dropped.notified())
+            .await
+            .unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn upstream_stream_error_preserves_partial_event_and_reports_failure() {
+        let app = Router::new().fallback(|| async {
+            let stream = futures::stream::unfold(0, |step| async move {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                let next = match step {
+                    0 => Ok(Bytes::from_static(b": ready\n\n")),
+                    1 => Ok(Bytes::from_static(b"data: {\"type\":")),
+                    2 => Err(std::io::Error::other("upstream disconnected")),
+                    _ => return None,
+                };
+                Some((next, step + 1))
+            });
+            Response::builder()
+                .header(header::CONTENT_TYPE, "text/event-stream")
+                .body(Body::from_stream(stream))
+                .unwrap()
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let state = ProxyState {
+            upstream_url: format!("http://{addr}"),
+            upstream_auth: Arc::new(UnusedAuth),
+            http_client: Arc::new(RwLock::new(build_http_client().unwrap())),
+            upstream_headers: vec![],
+            web_search: None,
+            copilot_responses: true,
+        };
+        let request = Request::builder()
+            .method("POST")
+            .uri("/responses")
+            .body(Body::empty())
+            .unwrap();
+        let response = proxy_handler(State(state), request).await.into_response();
+        let mut body = response.into_body();
+        let mut bytes = Vec::new();
+        let mut failed = false;
+        while let Some(frame) = tokio::time::timeout(Duration::from_secs(2), body.frame())
+            .await
+            .unwrap()
+        {
+            match frame {
+                Ok(frame) => bytes.extend_from_slice(&frame.into_data().unwrap()),
+                Err(_) => {
+                    failed = true;
+                    break;
+                }
+            }
+        }
+        assert!(failed);
+        assert_eq!(bytes, b": ready\n\ndata: {\"type\":");
+        server.abort();
+    }
+
     #[tokio::test(start_paused = true)]
     async fn upstream_500_is_delayed_then_converted_to_503() {
         let (addr, upstream_server) = spawn_upstream_500().await;
@@ -440,6 +823,7 @@ mod tests {
             http_client: Arc::new(RwLock::new(build_http_client().unwrap())),
             upstream_headers: vec![],
             web_search: None,
+            copilot_responses: false,
         };
         let request = Request::builder()
             .uri("/v1/messages")

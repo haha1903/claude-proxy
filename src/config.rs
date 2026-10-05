@@ -3,7 +3,7 @@ use std::env;
 
 /// Deserialize a string that may contain environment variable references.
 /// Supports both `${VAR_NAME}` and `$VAR_NAME` syntax.
-fn deserialize_env_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+pub(crate) fn deserialize_env_string<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
     D: Deserializer<'de>,
 {
@@ -87,11 +87,14 @@ pub struct ProxyConfig {
     pub upstream_url: String,
 
     /// API key that clients must provide to access this proxy
-    #[serde(deserialize_with = "deserialize_env_string")]
+    #[serde(default, deserialize_with = "deserialize_env_string")]
     pub client_api_key: String,
 
     /// Upstream authentication configuration
-    pub upstream_auth: UpstreamAuthConfig,
+    pub upstream_auth: Option<UpstreamAuthConfig>,
+
+    #[serde(default, deserialize_with = "crate::routing::deserialize_routing")]
+    pub copilot_routing: Option<crate::routing::CopilotRouting>,
 
     /// Custom headers to add to upstream requests
     #[serde(default)]
@@ -431,7 +434,7 @@ mod tests {
 
         let config: ProxyConfig = toml::from_str(toml_str).unwrap();
 
-        match config.upstream_auth {
+        match config.upstream_auth.unwrap() {
             UpstreamAuthConfig::AzureAd {
                 tenant_id,
                 client_id,
@@ -464,7 +467,7 @@ mod tests {
 
         let config: ProxyConfig = toml::from_str(toml_str).unwrap();
 
-        match config.upstream_auth {
+        match config.upstream_auth.unwrap() {
             UpstreamAuthConfig::ApiKey { api_key } => {
                 assert_eq!(api_key, "sk-ant-test-key");
             }
@@ -487,7 +490,7 @@ mod tests {
 
         let config: ProxyConfig = toml::from_str(toml_str).unwrap();
 
-        match config.upstream_auth {
+        match config.upstream_auth.unwrap() {
             UpstreamAuthConfig::Bearer { token } => {
                 assert_eq!(token, "my-bearer-token");
             }
@@ -567,7 +570,7 @@ mod tests {
         let config: ProxyConfig = toml::from_str(toml_str).unwrap();
 
         assert_eq!(config.client_api_key, "literal-proxy-key");
-        match config.upstream_auth {
+        match config.upstream_auth.unwrap() {
             UpstreamAuthConfig::AzureAd {
                 tenant_id,
                 client_id,
@@ -593,7 +596,7 @@ mod tests {
 
         let config: ProxyConfig = toml::from_str(toml_str).unwrap();
 
-        match config.upstream_auth {
+        match config.upstream_auth.unwrap() {
             UpstreamAuthConfig::AzureCli { scope } => {
                 assert_eq!(scope, "https://ai.azure.com/.default");
             }

@@ -1,0 +1,30 @@
+upstream_url = "https://api.githubcopilot.com"
+
+# When configured, routing replaces the legacy client_api_key/upstream_auth pair.
+# Every key has exactly one account. Multiple keys can reference the same account.
+[[copilot_routing.accounts]]
+name = "primary"
+github_token = "${GITHUB_PRIMARY_TOKEN}"
+
+[[copilot_routing.accounts]]
+name = "secondary"
+github_token = "${GITHUB_SECONDARY_TOKEN}"
+
+[[copilot_routing.clients]]
+api_key = "${CURRENT_CLIENT_KEY}"
+account = "primary"
+
+[[copilot_routing.clients]]
+api_key = "${NEW_CLIENT_KEY}"
+account = "secondary"
+
+[[copilot_routing.clients]]
+api_key = "${SHARED_CLIENT_KEY}"
+account = "primary"
+
+# Containers can instead set CLAUDE_PROXY__COPILOT_ROUTING to one JSON secret:
+# {"accounts":[{"name":"primary","github_token":"..."}],"clients":[{"api_key":"...","account":"primary"}]}
+# Restart/redeploy after updating the secret. Missing/unknown keys receive HTTP 401.
+# Duplicate keys, unknown accounts, empty credentials and custom auth headers fail
+# startup. There is no round-robin or fallback to another account on failure.
+# Keep real credentials in a secret store and never commit them to this file.

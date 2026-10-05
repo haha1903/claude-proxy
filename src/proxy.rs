@@ -14,9 +14,8 @@ use tokio::sync::RwLock;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, error, info, warn};
 
-use crate::auth::UpstreamAuth;
 use crate::copilot_responses::ResponsesStream;
-use crate::middleware::ClientAuthenticated;
+use crate::middleware::SelectedUpstreamAuth;
 use crate::web_search_emulation;
 use crate::websearch::WebSearchManager;
 
@@ -24,7 +23,6 @@ use crate::websearch::WebSearchManager;
 #[derive(Clone)]
 pub struct ProxyState {
     pub upstream_url: String,
-    pub upstream_auth: Arc<dyn UpstreamAuth>,
     pub http_client: Arc<RwLock<reqwest::Client>>,
     pub upstream_headers: Vec<(String, String)>,
     /// Web search manager; `None` disables emulation (pure passthrough).
@@ -115,7 +113,7 @@ pub async fn proxy_handler(
     for (name, value) in request.headers() {
         let name_str = name.as_str().to_lowercase();
         // Mask sensitive headers
-        if name_str == "x-api-key" || name_str == "authorization" {
+        if AUTH_HEADERS.contains(&name_str.as_str()) {
             debug!("  {}: [REDACTED]", name);
         } else {
             debug!("  {}: {:?}", name, value);
@@ -126,19 +124,16 @@ pub async fn proxy_handler(
     let upstream_url = format!("{}{}", state.upstream_url, request_target);
 
     // Check if the client is authenticated
-    let client_authenticated = request
-        .extensions()
-        .get::<ClientAuthenticated>()
-        .map(|auth| auth.0)
-        .unwrap_or(false);
+    let selected_auth = request.extensions().get::<SelectedUpstreamAuth>().cloned();
+    let client_authenticated = selected_auth.is_some();
 
     // Build headers for upstream request
     let mut upstream_headers = HeaderMap::new();
 
     // Only add upstream authentication if the client provided a valid API key
-    if client_authenticated {
+    if let Some(SelectedUpstreamAuth(upstream_auth)) = selected_auth {
         // Get auth header for upstream
-        let auth_header = match state.upstream_auth.get_auth_header().await {
+        let auth_header = match upstream_auth.get_auth_header().await {
             Ok(header) => header,
             Err(e) => {
                 error!("Failed to get upstream auth header: {}", e);
@@ -149,7 +144,7 @@ pub async fn proxy_handler(
             }
         };
 
-        let auth_header_name = state.upstream_auth.auth_header_name();
+        let auth_header_name = upstream_auth.auth_header_name();
         let is_api_key_auth = auth_header_name == "x-api-key";
 
         // Copy headers from original request based on auth type
@@ -189,7 +184,7 @@ pub async fn proxy_handler(
         }
 
         // Get additional headers from auth provider
-        match state.upstream_auth.get_additional_headers().await {
+        match upstream_auth.get_additional_headers().await {
             Ok(additional) => {
                 for (name, value) in additional {
                     if let Ok(header_name) = HeaderName::try_from(name) {
@@ -477,21 +472,10 @@ async fn handle_messages_with_web_search(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::AuthError;
-    use async_trait::async_trait;
     use axum::Router;
     use http_body_util::BodyExt;
     use std::net::SocketAddr;
     use tokio::net::TcpListener;
-
-    struct UnusedAuth;
-
-    #[async_trait]
-    impl UpstreamAuth for UnusedAuth {
-        async fn get_auth_header(&self) -> Result<HeaderValue, AuthError> {
-            Ok(HeaderValue::from_static("unused"))
-        }
-    }
 
     async fn spawn_upstream_500() -> (SocketAddr, tokio::task::JoinHandle<()>) {
         let app = Router::new()
@@ -521,7 +505,6 @@ mod tests {
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let state = ProxyState {
             upstream_url: format!("http://{addr}"),
-            upstream_auth: Arc::new(UnusedAuth),
             http_client: Arc::new(RwLock::new(build_http_client().unwrap())),
             upstream_headers: vec![],
             web_search: None,
@@ -657,7 +640,6 @@ mod tests {
             let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
             let state = ProxyState {
                 upstream_url: format!("http://{addr}"),
-                upstream_auth: Arc::new(UnusedAuth),
                 http_client: Arc::new(RwLock::new(build_http_client().unwrap())),
                 upstream_headers: vec![],
                 web_search: None,
@@ -733,7 +715,6 @@ mod tests {
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let state = ProxyState {
             upstream_url: format!("http://{addr}"),
-            upstream_auth: Arc::new(UnusedAuth),
             http_client: Arc::new(RwLock::new(build_http_client().unwrap())),
             upstream_headers: vec![],
             web_search: None,
@@ -782,7 +763,6 @@ mod tests {
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let state = ProxyState {
             upstream_url: format!("http://{addr}"),
-            upstream_auth: Arc::new(UnusedAuth),
             http_client: Arc::new(RwLock::new(build_http_client().unwrap())),
             upstream_headers: vec![],
             web_search: None,
@@ -819,7 +799,6 @@ mod tests {
         let (addr, upstream_server) = spawn_upstream_500().await;
         let state = ProxyState {
             upstream_url: format!("http://{}", addr),
-            upstream_auth: Arc::new(UnusedAuth),
             http_client: Arc::new(RwLock::new(build_http_client().unwrap())),
             upstream_headers: vec![],
             web_search: None,

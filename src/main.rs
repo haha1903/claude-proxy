@@ -2,6 +2,7 @@ mod acme;
 mod auth;
 mod config;
 mod copilot_responses;
+mod keyvault;
 mod middleware;
 mod proxy;
 mod routing;
@@ -188,7 +189,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Build the main proxy router
-    let app = build_proxy_router(&config)?;
+    let app = build_proxy_router(&config).await?;
 
     // Start server(s) based on TLS configuration
     match &config.tls {
@@ -241,8 +242,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Build the main proxy router
-fn build_proxy_router(config: &ProxyConfig) -> Result<Router, Box<dyn std::error::Error>> {
+async fn build_proxy_router(config: &ProxyConfig) -> Result<Router, Box<dyn std::error::Error>> {
     let api_key_state = ApiKeyValidatorState::from_config(config)?;
+    if let Some(url) = &config.copilot_vault_url {
+        keyvault::start(url, api_key_state.clone()).await?;
+    }
 
     // Create HTTP client for upstream requests
     let http_client = build_http_client().expect("Failed to create HTTP client");
@@ -260,6 +264,7 @@ fn build_proxy_router(config: &ProxyConfig) -> Result<Router, Box<dyn std::error
         upstream_headers: config.upstream_headers.clone(),
         web_search,
         copilot_responses: config.copilot_routing.is_some()
+            || config.copilot_vault_url.is_some()
             || matches!(
                 config.upstream_auth,
                 Some(UpstreamAuthConfig::Copilot { .. })
@@ -648,7 +653,14 @@ fn build_config(
             .and_then(|fc| fc.copilot_routing.clone()),
         Err(_) => return Err("CLAUDE_PROXY__COPILOT_ROUTING must be valid Unicode".into()),
     };
-    let upstream_auth = if copilot_routing.is_some() {
+    let copilot_vault_url = get_optional_value(
+        None,
+        "CLAUDE_PROXY__COPILOT_VAULT_URL",
+        file_config
+            .as_ref()
+            .and_then(|fc| fc.copilot_vault_url.clone()),
+    );
+    let upstream_auth = if copilot_routing.is_some() || copilot_vault_url.is_some() {
         None
     } else {
         Some(build_upstream_auth(
@@ -707,6 +719,7 @@ fn build_config(
         client_api_key,
         upstream_auth,
         copilot_routing,
+        copilot_vault_url,
         upstream_headers,
         logging,
         tls,
@@ -1152,7 +1165,7 @@ mod tests {
         let args = Args::parse_from(["claude-proxy"]);
         let config = build_config(&args, Some(file)).unwrap();
         assert!(config.upstream_auth.is_none());
-        let app = build_proxy_router(&config).unwrap();
+        let app = build_proxy_router(&config).await.unwrap();
         let response = app
             .oneshot(
                 axum::http::Request::builder()
@@ -1172,8 +1185,8 @@ mod tests {
             .is_empty());
     }
 
-    #[test]
-    fn legacy_config_still_requires_auth_and_key() {
+    #[tokio::test]
+    async fn legacy_config_still_requires_auth_and_key() {
         let args = Args::parse_from([
             "claude-proxy",
             "--upstream-url",
@@ -1188,6 +1201,6 @@ mod tests {
         args.client_api_key = Some("client".into());
         let config = build_config(&args, None).unwrap();
         assert!(config.copilot_routing.is_none());
-        assert!(build_proxy_router(&config).is_ok());
+        assert!(build_proxy_router(&config).await.is_ok());
     }
 }

@@ -1,11 +1,14 @@
 use axum::{
     body::Body,
     extract::State,
-    http::{Request, StatusCode},
+    http::{HeaderMap, Method, Request, StatusCode},
     middleware::Next,
     response::Response,
 };
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{Arc, RwLock as SyncRwLock},
+};
 use tracing::{debug, warn};
 
 use crate::auth::{create_upstream_auth, CopilotAuth, UpstreamAuth};
@@ -14,13 +17,88 @@ use crate::config::ProxyConfig;
 /// State for API key validation middleware
 #[derive(Clone)]
 pub struct ApiKeyValidatorState {
-    clients: HashMap<String, Arc<dyn UpstreamAuth>>,
+    clients: Arc<SyncRwLock<HashMap<String, Route>>>,
+    tokens: Arc<SyncRwLock<HashMap<String, Arc<dyn UpstreamAuth>>>>,
     allow_missing_key: bool,
+}
+
+#[derive(Clone)]
+struct Route {
+    name: String,
+    members: Vec<(String, Arc<dyn UpstreamAuth>)>,
+}
+
+impl Route {
+    fn single(auth: Arc<dyn UpstreamAuth>) -> Self {
+        Self {
+            name: String::new(),
+            members: vec![(String::new(), auth)],
+        }
+    }
+
+    fn select(
+        &self,
+        headers: &HeaderMap,
+        method: &Method,
+        path: &str,
+    ) -> Result<Arc<dyn UpstreamAuth>, StatusCode> {
+        if self.members.len() == 1 {
+            return Ok(self.members[0].1.clone());
+        }
+        let session = session_id(headers)?;
+        let discovery = method == Method::GET && matches!(path, "/models" | "/v1/models");
+        let session = session
+            .or(if discovery {
+                Some("model-discovery")
+            } else {
+                None
+            })
+            .ok_or(StatusCode::BAD_REQUEST)?;
+        self.members
+            .iter()
+            .max_by_key(|(login, _)| {
+                (
+                    crate::routing::rendezvous_score(&self.name, session, login),
+                    login,
+                )
+            })
+            .map(|(_, auth)| auth.clone())
+            .ok_or(StatusCode::UNAUTHORIZED)
+    }
+}
+
+fn session_id(headers: &HeaderMap) -> Result<Option<&str>, StatusCode> {
+    let mut session = None;
+    for name in [
+        "session-id",
+        "session_id",
+        "thread-id",
+        "x-claude-code-session-id",
+    ] {
+        for value in headers.get_all(name) {
+            let value = value.to_str().map_err(|_| StatusCode::BAD_REQUEST)?;
+            if value.is_empty()
+                || value.len() > 256
+                || !value.bytes().all(|b| b.is_ascii_graphic())
+                || session.is_some_and(|previous| previous != value)
+            {
+                return Err(StatusCode::BAD_REQUEST);
+            }
+            session = Some(value);
+        }
+    }
+    Ok(session)
 }
 
 impl ApiKeyValidatorState {
     pub fn validate_config(config: &ProxyConfig) -> Result<(), &'static str> {
-        if let Some(routing) = &config.copilot_routing {
+        if let Some(url) = &config.copilot_vault_url {
+            if config.copilot_routing.is_some() {
+                return Err("Configure only one Copilot routing source");
+            }
+            crate::keyvault::validate_vault_url(url)?;
+            crate::routing::validate_headers(&config.upstream_headers)
+        } else if let Some(routing) = &config.copilot_routing {
             routing.validate(&config.upstream_headers)
         } else if config.client_api_key.trim().is_empty() || config.upstream_auth.is_none() {
             Err("client_api_key and upstream_auth are required without copilot_routing")
@@ -31,32 +109,105 @@ impl ApiKeyValidatorState {
 
     pub fn from_config(config: &ProxyConfig) -> Result<Self, &'static str> {
         Self::validate_config(config)?;
+        let state = Self {
+            clients: Arc::new(SyncRwLock::new(HashMap::new())),
+            tokens: Arc::new(SyncRwLock::new(HashMap::new())),
+            allow_missing_key: config.copilot_routing.is_none()
+                && config.copilot_vault_url.is_none(),
+        };
         if let Some(routing) = &config.copilot_routing {
-            let mut tokens: HashMap<&str, Arc<dyn UpstreamAuth>> = HashMap::new();
-            let mut accounts = HashMap::new();
-            for account in &routing.accounts {
-                // Repeated GitHub tokens share one cache, even under different names.
-                let auth = tokens
-                    .entry(&account.github_token)
-                    .or_insert_with(|| Arc::new(CopilotAuth::new(account.github_token.clone())));
-                accounts.insert(&account.name, auth.clone());
-            }
-            let clients = routing
-                .clients
-                .iter()
-                .map(|client| (client.api_key.clone(), accounts[&client.account].clone()))
-                .collect();
-            Ok(Self {
-                clients,
-                allow_missing_key: false,
-            })
-        } else {
+            state.replace_copilot(routing)?;
+        } else if config.copilot_vault_url.is_none() {
             let auth = create_upstream_auth(config.upstream_auth.as_ref().unwrap());
-            Ok(Self {
-                clients: HashMap::from([(config.client_api_key.clone(), auth)]),
-                allow_missing_key: true,
-            })
+            state
+                .clients
+                .write()
+                .map_err(|_| "Routing lock failed")?
+                .insert(config.client_api_key.clone(), Route::single(auth));
         }
+        Ok(state)
+    }
+
+    #[cfg(test)]
+    pub fn lookup(&self, key: &str) -> Option<Arc<dyn UpstreamAuth>> {
+        self.clients
+            .read()
+            .ok()?
+            .get(key)?
+            .members
+            .first()
+            .map(|(_, auth)| auth.clone())
+    }
+
+    pub fn replace_records(
+        &self,
+        records: &HashMap<String, crate::routing::VaultRecord>,
+    ) -> Result<(), &'static str> {
+        let mut previous = self.tokens.write().map_err(|_| "Routing lock failed")?;
+        let mut tokens = HashMap::new();
+        let mut clients = HashMap::new();
+        for (name, record) in records {
+            if !record.validate() || clients.contains_key(&record.api_key) {
+                return Err("Invalid Vault routing");
+            }
+            let mut members = Vec::new();
+            for account in &record.github {
+                let auth = tokens.entry(account.token.clone()).or_insert_with(|| {
+                    previous
+                        .get(&account.token)
+                        .cloned()
+                        .unwrap_or_else(|| Arc::new(CopilotAuth::new(account.token.clone())))
+                });
+                members.push((account.login.to_ascii_lowercase(), auth.clone()));
+            }
+            clients.insert(
+                record.api_key.clone(),
+                Route {
+                    name: name.clone(),
+                    members,
+                },
+            );
+        }
+        *self.clients.write().map_err(|_| "Routing lock failed")? = clients;
+        *previous = tokens;
+        Ok(())
+    }
+
+    pub fn replace_copilot(
+        &self,
+        routing: &crate::routing::CopilotRouting,
+    ) -> Result<(), &'static str> {
+        if !routing.accounts.is_empty() || !routing.clients.is_empty() {
+            routing.validate(&[])?;
+        }
+        let mut previous = self.tokens.write().map_err(|_| "Routing lock failed")?;
+        let mut tokens = HashMap::new();
+        let mut accounts = HashMap::new();
+        for account in &routing.accounts {
+            let auth = tokens
+                .entry(account.github_token.clone())
+                .or_insert_with(|| {
+                    previous
+                        .get(&account.github_token)
+                        .cloned()
+                        .unwrap_or_else(|| Arc::new(CopilotAuth::new(account.github_token.clone())))
+                });
+            accounts.insert(&account.name, auth.clone());
+        }
+        let clients = routing
+            .clients
+            .iter()
+            .map(|client| {
+                (
+                    client.api_key.clone(),
+                    Route::single(accounts[&client.account].clone()),
+                )
+            })
+            .collect();
+        // Publish the complete map once. In-flight requests retain their selected Arc.
+        *self.clients.write().map_err(|_| "Routing lock failed")? = clients;
+        *previous = tokens;
+        Ok(())
     }
 }
 
@@ -87,23 +238,27 @@ pub async fn validate_client_api_key(
                 .map(|s| s.to_string())
         });
 
-    match api_key {
-        Some(key) if state.clients.contains_key(&key) => {
-            request
-                .extensions_mut()
-                .insert(SelectedUpstreamAuth(state.clients[&key].clone()));
+    let route = api_key
+        .as_deref()
+        .and_then(|key| state.clients.read().ok()?.get(key).cloned());
+    let selected = route
+        .map(|route| route.select(request.headers(), request.method(), request.uri().path()))
+        .transpose()?;
+    match (api_key, selected) {
+        (Some(_), Some(auth)) => {
+            request.extensions_mut().insert(SelectedUpstreamAuth(auth));
             Ok(next.run(request).await)
         }
-        Some(_) => {
+        (Some(_), None) => {
             warn!("Invalid API key provided");
             Err(StatusCode::UNAUTHORIZED)
         }
-        None if state.allow_missing_key => {
+        (None, _) if state.allow_missing_key => {
             // No API key provided - relay without upstream auth
             debug!("No API key provided, relaying without upstream authentication");
             Ok(next.run(request).await)
         }
-        None => Err(StatusCode::UNAUTHORIZED),
+        _ => Err(StatusCode::UNAUTHORIZED),
     }
 }
 
@@ -141,18 +296,18 @@ mod tests {
         let state = ApiKeyValidatorState::from_config(&config).unwrap();
         assert!(!state.allow_missing_key);
         assert!(Arc::ptr_eq(
-            &state.clients["client-one"],
-            &state.clients["client-shared"]
+            &state.lookup("client-one").unwrap(),
+            &state.lookup("client-shared").unwrap()
         ));
         assert!(!Arc::ptr_eq(
-            &state.clients["client-one"],
-            &state.clients["client-two"]
+            &state.lookup("client-one").unwrap(),
+            &state.lookup("client-two").unwrap()
         ));
         config.copilot_routing.as_mut().unwrap().accounts[1].github_token = "github-one".into();
         let state = ApiKeyValidatorState::from_config(&config).unwrap();
         assert!(Arc::ptr_eq(
-            &state.clients["client-one"],
-            &state.clients["client-two"]
+            &state.lookup("client-one").unwrap(),
+            &state.lookup("client-two").unwrap()
         ));
         config.copilot_routing.as_mut().unwrap().clients[0].account = "unknown".into();
         assert!(ApiKeyValidatorState::from_config(&config).is_err());
@@ -162,11 +317,12 @@ mod tests {
         let one: Arc<dyn UpstreamAuth> = Arc::new(BearerAuth::new("upstream-one".into()));
         let two: Arc<dyn UpstreamAuth> = Arc::new(BearerAuth::new("upstream-two".into()));
         ApiKeyValidatorState {
-            clients: HashMap::from([
-                ("client-one".into(), one.clone()),
-                ("client-shared".into(), one),
-                ("client-two".into(), two),
-            ]),
+            clients: Arc::new(SyncRwLock::new(HashMap::from([
+                ("client-one".into(), Route::single(one.clone())),
+                ("client-shared".into(), Route::single(one)),
+                ("client-two".into(), Route::single(two)),
+            ]))),
+            tokens: Arc::new(SyncRwLock::new(HashMap::new())),
             allow_missing_key,
         }
     }
@@ -326,10 +482,12 @@ mod tests {
     #[tokio::test]
     async fn token_exchange_failure_does_not_use_another_account() {
         let (url, calls, server) = upstream().await;
-        let mut state = state(false);
+        let state = state(false);
         state
             .clients
-            .insert("client-one".into(), Arc::new(FailedAuth));
+            .write()
+            .unwrap()
+            .insert("client-one".into(), Route::single(Arc::new(FailedAuth)));
         let response = app(state, url)
             .oneshot(
                 Request::builder()
@@ -342,5 +500,130 @@ mod tests {
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         server.abort();
+    }
+    fn pool(logins: &[&str]) -> Route {
+        Route {
+            name: "copilot-5".into(),
+            members: logins
+                .iter()
+                .map(|s| {
+                    (
+                        (*s).into(),
+                        Arc::new(BearerAuth::new((*s).into())) as Arc<dyn UpstreamAuth>,
+                    )
+                })
+                .collect(),
+        }
+    }
+    async fn selected(route: &Route, session: &str) -> String {
+        let mut headers = HeaderMap::new();
+        headers.insert("session-id", session.parse().unwrap());
+        route
+            .select(&headers, &Method::POST, "/responses")
+            .unwrap()
+            .get_auth_header()
+            .await
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned()
+    }
+
+    #[tokio::test]
+    async fn rendezvous_survives_reorder_and_changes_only_required_sessions() {
+        let original = pool(&["alice", "bob", "charlie"]);
+        let reordered = pool(&["charlie", "alice", "bob"]);
+        let added = pool(&["alice", "bob", "charlie", "dave"]);
+        let removed = pool(&["alice", "charlie"]);
+        let mut moved = 0;
+        for i in 0..1000 {
+            let session = format!("session-{i}");
+            let first = selected(&original, &session).await;
+            assert_eq!(first, selected(&reordered, &session).await);
+            let next = selected(&added, &session).await;
+            if next != first {
+                assert_eq!(next, "Bearer dave");
+                moved += 1;
+            }
+            if first != "Bearer bob" {
+                assert_eq!(first, selected(&removed, &session).await);
+            }
+        }
+        assert!((180..320).contains(&moved));
+        let mut changed = original.clone();
+        for (_, auth) in &mut changed.members {
+            *auth = Arc::new(BearerAuth::new("rotated".into()));
+        }
+        let scores = |route: &Route| {
+            route
+                .members
+                .iter()
+                .map(|(login, _)| crate::routing::rendezvous_score(&route.name, "stable", login))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(scores(&original), scores(&changed));
+        assert_eq!(
+            crate::routing::rendezvous_score("pool", "session", "Alice"),
+            crate::routing::rendezvous_score("pool", "session", "alice")
+        );
+    }
+
+    #[test]
+    fn multiple_accounts_require_unambiguous_stable_session_headers() {
+        let route = pool(&["alice", "bob"]);
+        let mut headers = HeaderMap::new();
+        assert!(route.select(&headers, &Method::POST, "/responses").is_err());
+        assert!(route.select(&headers, &Method::GET, "/models").is_ok());
+        assert!(route.select(&headers, &Method::GET, "/v1/models").is_ok());
+        for name in [
+            "session-id",
+            "session_id",
+            "thread-id",
+            "x-claude-code-session-id",
+        ] {
+            headers.insert(name, "stable".parse().unwrap());
+            assert_eq!(session_id(&headers).unwrap(), Some("stable"));
+        }
+        headers.insert("thread-id", "different".parse().unwrap());
+        assert!(route.select(&headers, &Method::POST, "/responses").is_err());
+        headers.clear();
+        headers.insert("session-id", "".parse().unwrap());
+        assert!(session_id(&headers).is_err());
+        headers.insert("session-id", "a".repeat(257).parse().unwrap());
+        assert!(session_id(&headers).is_err());
+        headers.clear();
+        headers.insert("x-client-request-id", "request-only".parse().unwrap());
+        assert!(route.select(&headers, &Method::POST, "/messages").is_err());
+        assert!(pool(&["alice"])
+            .select(&headers, &Method::POST, "/messages")
+            .is_ok());
+    }
+
+    #[test]
+    fn invalid_pool_refresh_is_atomic() {
+        let state = state(false);
+        let mut records = HashMap::new();
+        let good: crate::routing::VaultRecord = serde_json::from_value(serde_json::json!({"api_key":"new-key","github":[{"login":"alice","token":"fixture-token"},{"login":"bob","token":"fixture-bob"}]})).unwrap();
+        records.insert("copilot-5".into(), good.clone());
+        state.replace_records(&records).unwrap();
+        let before = state.lookup("new-key").unwrap();
+        records.get_mut("copilot-5").unwrap().github[0].token = "rotated-token".into();
+        state.replace_records(&records).unwrap();
+        assert!(!Arc::ptr_eq(&before, &state.lookup("new-key").unwrap()));
+        records.insert("copilot-6".into(), good.clone());
+        assert!(state.replace_records(&records).is_err());
+        assert!(state.lookup("new-key").is_some());
+        for mutate in [
+            |r: &mut crate::routing::VaultRecord| r.policy = "most_remaining".into(),
+            |r: &mut crate::routing::VaultRecord| r.github.clear(),
+            |r: &mut crate::routing::VaultRecord| r.github[1].login = "ALICE".into(),
+            |r: &mut crate::routing::VaultRecord| r.github[0].token = "bad token".into(),
+        ] {
+            let mut record = good.clone();
+            mutate(&mut record);
+            assert!(!record.validate());
+        }
+        state.replace_records(&HashMap::new()).unwrap();
+        assert!(state.lookup("new-key").is_none());
     }
 }

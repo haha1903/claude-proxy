@@ -1,0 +1,269 @@
+#!/usr/bin/env python3
+"""Choose the default Codex provider and Copilot proxy account."""
+
+import copy
+import json
+import os
+import re
+import sys
+import tempfile
+import time
+import tomllib
+from pathlib import Path
+
+PROXY = "copilot-proxy"
+MODEL = "gpt-6-astra"
+PROXIES = {"copilot1": ("Copilot 1", "client-haha1903"), "copilot2": ("Copilot 2", "client-current"),
+           "copilot3": ("Copilot 3", "client-copilot3")}
+VAULT_KEYS = None
+ALIASES = {"proxy1": "copilot1", "proxy2": "copilot2", "proxy3": "copilot3"}
+USAGE = """Usage: cx [official|copilot<N>|status]
+Run cx without arguments to discover available Copilot entries in Key Vault.
+Switches defaults for new Codex sessions. Each Copilot provider keeps a fixed key.
+The legacy copilot-proxy provider and cx copilot use Copilot 1.
+"""
+
+
+class ConfigError(Exception):
+    pass
+
+
+def vault_loader():
+    import importlib.util
+    path = Path(__file__).resolve().parent / "copilot_vault.py"
+    if not path.exists():
+        path = Path.home() / ".local/lib/copilot-vault/copilot_vault.py"
+    spec = importlib.util.spec_from_file_location("copilot_vault", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def discover():
+    global PROXIES, ALIASES
+    if not (Path.home() / ".config/claude-proxy/key-vault.json").exists():
+        return None
+    try:
+        vault = vault_loader()
+        result = vault.load_records()
+        if result["errors"]:
+            raise ConfigError("Key Vault has unavailable or invalid Copilot records.")
+        PROXIES = {f"copilot{r['number']}": (f"Copilot {r['number']}", r["name"]) for r in result["records"]}
+        ALIASES = {"proxy" + key[7:]: key for key in PROXIES}
+        return {f"copilot{r['number']}": r["api_key"] for r in result["records"]}
+    except ConfigError:
+        raise
+    except Exception:
+        raise ConfigError("Cannot read Copilot records from Key Vault. Check Azure sign-in and Vault access.") from None
+
+
+def proxy_keys():
+    if VAULT_KEYS is not None:
+        return VAULT_KEYS
+    path = Path.home() / ".config/claude-proxy/copilot-accounts.json"
+    try:
+        data = json.loads(path.read_text())
+        accounts, clients = data["accounts"], data["clients"]
+        result = {}
+        for selection, (label, client_id) in PROXIES.items():
+            client = clients[client_id]
+            key = client.get("api_key")
+            if not isinstance(key, str) or not key or not all(33 <= ord(c) <= 126 for c in key):
+                raise ConfigError(f"Missing or invalid client key for {label}.")
+            if client.get("account") not in accounts:
+                raise ConfigError(f"Unknown account binding for {label}.")
+            result[selection] = key
+        if len(set(result.values())) != len(result):
+            raise ConfigError("Proxy options must use different client keys.")
+        return result
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        raise ConfigError(f"Cannot read proxy key configuration: {path}") from None
+
+
+def show_status(config):
+    entry = config.get("model_providers", {}).get(config.get("model_provider", "openai"), {})
+    try:
+        label = next((PROXIES[selection][0] for selection, key in proxy_keys().items()
+                      if key == entry.get("experimental_bearer_token")), "unknown")
+    except ConfigError:
+        label = "unknown (proxy key configuration unavailable)"
+    print("Provider:", config.get("model_provider", "openai"))
+    print("Model:", config.get("model", "(default)"))
+    print("Configured proxy:", label)
+    print("App provider name:", entry.get("name", "(not configured)"))
+
+
+def choose_mode(config):
+    show_status(config)
+    choices = {"0": None, "": None, "1": "official"}
+    print("\n1) Official OpenAI")
+    for index, (provider, (label, _)) in enumerate(PROXIES.items(), 2):
+        print(f"{index}) {label}")
+        choices[str(index)] = provider
+    last = str(len(PROXIES) + 2)
+    print(f"{last}) Status\n0) Cancel")
+    choices[last] = "status"
+    while True:
+        answer = input(f"Select [0-{last}]: ").strip()
+        if answer in choices:
+            return choices[answer]
+        print("Enter " + ", ".join(str(i) for i in range(int(last))) + " or " + last + ".")
+
+
+def replace_setting(source, key, value):
+    pattern = rf"(?m)^[ \t]*{re.escape(key)}[ \t]*=.*$"
+    replacement = f"{key} = {json.dumps(value, ensure_ascii=False)}"
+    if re.search(pattern, source):
+        return re.sub(pattern, lambda _: replacement, source)
+    return replacement + "\n" + source
+
+
+def provider_block(tables, provider):
+    name = re.escape(provider)
+    header = re.search(rf'''(?m)^[ \t]*\[model_providers\.(?:{name}|"{name}"|'{name}')\][ \t]*(?:\#.*)?$''', tables)
+    if not header:
+        raise ConfigError(f"Cannot locate the {provider} table without changing other configuration.")
+    start = header.end()
+    next_table = re.search(r"(?m)^[ \t]*\[", tables[start:])
+    end = start + next_table.start() if next_table else len(tables)
+    return start, end, tables[start:end].lstrip("\n")
+
+
+def configure_proxies(tables, expected):
+    providers = expected["model_providers"]
+    template = copy.deepcopy(providers[PROXY])
+    _, _, template_body = provider_block(tables, PROXY)
+    keys = proxy_keys()
+    for provider, selection in ([(PROXY, "copilot1")] if "copilot1" in PROXIES else []) + [(name, name) for name in PROXIES]:
+        entry = providers.get(provider, copy.deepcopy(template))
+        if entry.get("base_url") != template["base_url"]:
+            raise ConfigError(f"Provider {provider} points to a different endpoint.")
+        if any(entry.get(field) for field in ("auth", "env_key", "http_headers", "env_http_headers", "requires_openai_auth")):
+            raise ConfigError(f"Provider {provider} has additional authentication settings.")
+        exists = provider in providers
+        if exists:
+            start, end, body = provider_block(tables, provider)
+        else:
+            body = template_body
+        label = PROXIES[selection][0]
+        body = replace_setting(body, "experimental_bearer_token", keys[selection])
+        body = replace_setting(body, "name", label)
+        if exists:
+            tables = tables[:start] + "\n" + body + tables[end:]
+        else:
+            tables = tables.rstrip() + f"\n\n[model_providers.{provider}]\n" + body.rstrip() + "\n"
+        entry.update(name=label, experimental_bearer_token=keys[selection])
+        providers[provider] = entry
+    return tables
+
+
+def switch_config(path, original, config, mode, selection):
+    provider = "openai" if mode == "official" else selection
+    entry = config.get("model_providers", {}).get(PROXY, {})
+    if selection and not entry.get("base_url"):
+        raise ConfigError("Missing model_providers.copilot-proxy configuration.")
+    label = PROXIES[selection][0] if selection else None
+
+    source = original.decode()
+    first_table = re.search(r"(?m)^[ \t]*\[", source)
+    end = first_table.start() if first_table else len(source)
+    root, tables = source[:end], source[end:]
+    for name, value in [("model_provider", provider), ("model", MODEL)]:
+        root = replace_setting(root, name, value)
+    expected = copy.deepcopy(config)
+    expected.update(model_provider=provider, model=MODEL)
+    if selection:
+        tables = configure_proxies(tables, expected)
+
+    updated = (root + tables).encode()
+    try:
+        valid = tomllib.loads(updated.decode()) == expected
+    except ValueError:
+        valid = False
+    if not valid:
+        raise ConfigError("Validation failed: unrelated configuration would change.")
+    if updated == original:
+        print(f"Already using {provider}" + (f" / {label}" if selection else "") + f" / {MODEL}.")
+        return
+    if path.read_bytes() != original:
+        raise ConfigError("Codex configuration changed while selecting. Run cx again.")
+
+    backup = path.with_name(f"config.toml.backup-{time.time_ns()}")
+    fd = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "wb") as handle:
+        handle.write(original)
+    fd, temporary = tempfile.mkstemp(prefix=".config-switch-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(updated)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+    if tomllib.loads(path.read_text()) != expected:
+        raise ConfigError("Configuration readback did not match the selected settings.")
+    print(f"Switched to {provider}" + (f" / {label}" if selection else "") + f" / {MODEL}.")
+    print(f"Backup: {backup}")
+    print("Restart Codex and start a new chat to use these defaults.")
+    print("Provider keys stay fixed. Legacy copilot-proxy chats use Copilot 1.")
+
+
+def main(args=None):
+    args = sys.argv[1:] if args is None else args
+    if args in (["-h"], ["--help"]):
+        print(USAGE, end="")
+        return 0
+    global VAULT_KEYS
+    try:
+        VAULT_KEYS = discover()
+    except ConfigError as error:
+        print(str(error), file=sys.stderr)
+        return 1
+    args = [ALIASES.get(arg, arg) for arg in args]
+    if args and not (len(args) == 1 and args[0] in {"official", "copilot", "status", *PROXIES}
+                     or len(args) == 2 and args[0] == "copilot" and args[1] in PROXIES):
+        print(USAGE, file=sys.stderr, end="")
+        return 2
+    path = Path.home() / ".codex/config.toml"
+    try:
+        original = path.read_bytes()
+        config = tomllib.loads(original.decode())
+    except (OSError, ValueError):
+        print(f"Cannot read Codex configuration: {path}", file=sys.stderr)
+        return 1
+    try:
+        if not args:
+            if not sys.stdin.isatty():
+                show_status(config)
+                print("Run cx in a terminal for the menu, or use cx copilot1 / cx copilot2 / cx copilot3.")
+                return 0
+            mode = choose_mode(config)
+            if mode is None:
+                print("Cancelled. Configuration unchanged.")
+                return 0
+        else:
+            mode = args[-1]
+        if mode == "copilot":
+            mode = "copilot1"
+        if mode == "copilot1" and mode not in PROXIES:
+            raise ConfigError("Copilot 1 is unavailable in Key Vault.")
+        if mode == "status":
+            show_status(config)
+            print("These are defaults; existing chats may keep their previous provider and account history.")
+        else:
+            selection = mode if mode in PROXIES else None
+            switch_config(path, original, config, mode, selection)
+        return 0
+    except (EOFError, KeyboardInterrupt):
+        print("\nCancelled. Configuration unchanged.")
+        return 0
+    except ConfigError as error:
+        print(str(error), file=sys.stderr)
+        return 1
+    except OSError as error:
+        print(f"Cannot update Codex configuration ({type(error).__name__}).", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

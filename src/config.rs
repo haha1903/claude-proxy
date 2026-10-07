@@ -96,6 +96,9 @@ pub struct ProxyConfig {
     #[serde(default, deserialize_with = "crate::routing::deserialize_routing")]
     pub copilot_routing: Option<crate::routing::CopilotRouting>,
 
+    #[serde(default)]
+    pub copilot_vault_url: Option<String>,
+
     /// Custom headers to add to upstream requests
     #[serde(default)]
     pub upstream_headers: Vec<(String, String)>,

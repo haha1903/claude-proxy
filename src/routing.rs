@@ -67,19 +67,73 @@ impl CopilotRouting {
                 return Err("copilot_routing client references an unknown account");
             }
         }
-        if headers.iter().any(|(name, _)| {
-            ["authorization", "api-key", "x-api-key"]
-                .iter()
-                .any(|reserved| name.eq_ignore_ascii_case(reserved))
-        }) {
-            return Err("copilot_routing forbids custom authentication headers");
-        }
-        Ok(())
+        validate_headers(headers)
     }
+}
+
+pub fn validate_headers(headers: &[(String, String)]) -> Result<(), &'static str> {
+    if headers.iter().any(|(name, _)| {
+        ["authorization", "api-key", "x-api-key"]
+            .iter()
+            .any(|reserved| name.eq_ignore_ascii_case(reserved))
+    }) {
+        return Err("copilot_routing forbids custom authentication headers");
+    }
+    Ok(())
 }
 
 fn valid_credential(value: &str) -> bool {
     !value.is_empty() && value.bytes().all(|b| b.is_ascii_graphic())
+}
+
+#[derive(Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct VaultRecord {
+    pub api_key: String,
+    #[serde(default = "default_policy")]
+    pub policy: String,
+    pub github: Vec<GithubAccount>,
+}
+
+#[derive(Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct GithubAccount {
+    pub login: String,
+    pub token: String,
+}
+
+fn default_policy() -> String {
+    "session_hash".into()
+}
+
+impl VaultRecord {
+    pub fn validate(&self) -> bool {
+        let mut identities = HashSet::new();
+        valid_credential(&self.api_key)
+            && self.policy == "session_hash"
+            && !self.github.is_empty()
+            && self.github.iter().all(|account| {
+                !account.login.is_empty()
+                    && account.login.len() <= 100
+                    && account
+                        .login
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+                    && valid_credential(&account.token)
+                    && identities.insert(account.login.to_ascii_lowercase())
+            })
+    }
+}
+
+// Length prefixes make the hash input unambiguous. Credentials never define identity.
+pub fn rendezvous_score(pool: &str, session: &str, login: &str) -> Vec<u8> {
+    let mut hash = ring::digest::Context::new(&ring::digest::SHA256);
+    hash.update(b"copilot-session-v1");
+    for part in [pool, session, &login.to_ascii_lowercase()] {
+        hash.update(&(part.len() as u64).to_be_bytes());
+        hash.update(part.as_bytes());
+    }
+    hash.finish().as_ref().to_vec()
 }
 
 // Environment sources provide one JSON string, while TOML provides a table.

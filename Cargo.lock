@@ -331,6 +331,7 @@ dependencies = [
  "instant-acme",
  "rcgen",
  "reqwest",
+ "ring",
  "rustls",
  "serde",
  "serde_json",

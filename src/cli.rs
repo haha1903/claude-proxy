@@ -17,7 +17,7 @@ pub struct Args {
     #[arg(short, long, value_name = "FILE")]
     config: Option<String>,
 
-    /// Base64 configuration decryption secret (or CLAUDE_PROXY_SECRET)
+    /// Local-only base64 decryption secret; use CLAUDE_PROXY_SECRET for deployment
     #[arg(long, value_name = "SECRET")]
     secret: Option<String>,
 
@@ -156,7 +156,7 @@ fn environment(name: &str) -> Result<Option<String>, &'static str> {
     }
 }
 
-fn load_source(args: &Args) -> Result<Option<ProxyConfig>, Box<dyn std::error::Error>> {
+fn load_source(args: &Args) -> Result<Option<settings::LoadedConfig>, Box<dyn std::error::Error>> {
     let secret = args.secret.clone().or(environment("CLAUDE_PROXY_SECRET")?);
     if let Some(path) = &args.config {
         return read_source(path, secret.as_deref()).map(Some);
@@ -188,7 +188,7 @@ fn load_source(args: &Args) -> Result<Option<ProxyConfig>, Box<dyn std::error::E
 fn read_source(
     path: &str,
     secret: Option<&str>,
-) -> Result<ProxyConfig, Box<dyn std::error::Error>> {
+) -> Result<settings::LoadedConfig, Box<dyn std::error::Error>> {
     let source = std::fs::read_to_string(path).map_err(|_| "Cannot read configuration file")?;
     Ok(settings::read(&source, secret)?)
 }
@@ -248,9 +248,13 @@ fn get_optional_value<T: Clone + FromEnvStr>(
 /// Build the final config by merging CLI args, env vars, file config, and defaults
 fn build_config(
     args: &Args,
-    file_config: Option<ProxyConfig>,
+    source: Option<settings::LoadedConfig>,
 ) -> Result<ProxyConfig, Box<dyn std::error::Error>> {
     let default_azure_scope = "https://ai.azure.com/.default".to_string();
+    let explicit_upstream = source
+        .as_ref()
+        .is_some_and(|source| source.explicit_upstream);
+    let file_config = source.map(|source| source.config);
 
     // Extract file values
     let (file_bind_address, file_port, file_upstream_url, file_client_api_key, file_upstream_auth) =
@@ -278,12 +282,6 @@ fn build_config(
 
     let port = get_value(args.port, "CLAUDE_PROXY__PORT", file_port, 8080);
 
-    let upstream_url = get_optional_value(
-        args.upstream_url.clone(),
-        "CLAUDE_PROXY__UPSTREAM_URL",
-        file_upstream_url,
-    );
-
     let client_api_key = get_optional_value(
         args.client_api_key.clone(),
         "CLAUDE_PROXY__CLIENT_API_KEY",
@@ -307,6 +305,15 @@ fn build_config(
             &default_azure_scope,
         )?)
     };
+
+    let uses_copilot = copilot_routing.is_some()
+        || copilot_pools.is_some()
+        || matches!(upstream_auth, Some(UpstreamAuthConfig::Copilot { .. }));
+    let upstream_url = get_optional_value(
+        args.upstream_url.clone(),
+        "CLAUDE_PROXY__UPSTREAM_URL",
+        file_upstream_url.filter(|_| explicit_upstream || !uses_copilot),
+    );
 
     // Build logging config
     let logging = build_logging_config(args, file_logging);
@@ -794,6 +801,31 @@ mod tests {
     use http_body_util::BodyExt;
     use tower::ServiceExt;
 
+    #[test]
+    fn copilot_cli_auth_requires_explicit_source_upstream() {
+        let source = || {
+            settings::read(
+            r#"{"client_api_key":"fixture-client","upstream_auth":{"type":"api_key","api_key":"fixture-upstream"}}"#,
+            None,
+        ).unwrap()
+        };
+        let default = build_config(&Args::parse_from(["claude-proxy"]), Some(source())).unwrap();
+        assert_eq!(default.upstream_url, "https://api.anthropic.com");
+        let mut args = Args::parse_from([
+            "claude-proxy",
+            "--upstream-auth-type",
+            "copilot",
+            "--upstream-github-token",
+            "fixture-token",
+        ]);
+        assert!(build_config(&args, Some(source())).is_err());
+        args.upstream_url = Some("http://127.0.0.1:1".into());
+        assert_eq!(
+            build_config(&args, Some(source())).unwrap().upstream_url,
+            "http://127.0.0.1:1"
+        );
+    }
+
     #[tokio::test]
     async fn mapped_config_builds_router_and_requires_client_key() {
         let mut file: ProxyConfig = serde_json::from_value(serde_json::json!({
@@ -802,7 +834,14 @@ mod tests {
         .unwrap();
         file.copilot_routing = Some(crate::routing::tests::routing());
         let args = Args::parse_from(["claude-proxy"]);
-        let config = build_config(&args, Some(file)).unwrap();
+        let config = build_config(
+            &args,
+            Some(settings::LoadedConfig {
+                config: file,
+                explicit_upstream: true,
+            }),
+        )
+        .unwrap();
         assert!(config.upstream_auth.is_none());
         let app = build_proxy_router(&config).await.unwrap();
         let response = app

@@ -206,3 +206,41 @@ fn copilot_source_requires_an_explicit_upstream_and_accepts_cli_override() {
         .args(["--upstream-url", "http://127.0.0.1:1"]);
     assert_authenticated_startup(overridden);
 }
+
+#[test]
+fn encryption_validation_ignores_operator_environment() {
+    for (upstream, succeeds) in [
+        ("\"upstream_url\":\"http://127.0.0.1:1\",", true),
+        ("", false),
+    ] {
+        let path = std::env::temp_dir().join(format!("proxy-env-{}.json", uuid::Uuid::new_v4()));
+        let plaintext = format!(
+            "{{{upstream}\"copilot_pools\":{{\"copilot-1\":{{\"api_key\":\"fixture-client\",\"github\":[{{\"login\":\"alice\",\"token\":\"fixture-token\"}}]}}}}}}"
+        );
+        let mut process = command();
+        if succeeds {
+            process.env("CLAUDE_PROXY__COPILOT_ROUTING", "invalid-local-setting");
+        }
+        let mut child = process
+            .args(["--encrypt-config", path.to_str().unwrap()])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(plaintext.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        let created = path.exists();
+        if created {
+            std::fs::remove_file(path).unwrap();
+        }
+        assert_eq!(output.status.success(), succeeds);
+        assert_eq!(created, succeeds);
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("fixture-token"));
+    }
+}

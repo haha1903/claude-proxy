@@ -13,6 +13,12 @@ const AAD: &[u8] = b"claude-proxy-config-v1";
 const LIMIT: usize = 1024 * 1024;
 const ERROR: &str = "Invalid encrypted proxy configuration";
 
+#[derive(Debug)]
+pub struct LoadedConfig {
+    pub config: ProxyConfig,
+    pub explicit_upstream: bool,
+}
+
 pub fn write_settings(input: impl Read, path: &Path) -> Result<(), &'static str> {
     let mut plaintext = Vec::new();
     input
@@ -38,8 +44,11 @@ fn encrypt(plaintext: &[u8]) -> Result<Vec<u8>, &'static str> {
     if plaintext.len() > LIMIT {
         return Err(ERROR);
     }
-    let config = parse_plaintext(std::str::from_utf8(plaintext).map_err(|_| ERROR)?)?;
-    config.validate_auth()?;
+    let loaded = parse_plaintext(std::str::from_utf8(plaintext).map_err(|_| ERROR)?, false)?;
+    if loaded.config.uses_copilot() && !loaded.explicit_upstream {
+        return Err("Copilot requires an explicit upstream_url");
+    }
+    loaded.config.validate_auth()?;
     let random = SystemRandom::new();
     let mut key_bytes = [0; 32];
     let mut nonce_bytes = [0; 12];
@@ -71,39 +80,39 @@ fn encrypt(plaintext: &[u8]) -> Result<Vec<u8>, &'static str> {
     .map_err(|_| ERROR)
 }
 
-pub fn read(config: &str, secret: Option<&str>) -> Result<ProxyConfig, &'static str> {
+pub fn read(config: &str, secret: Option<&str>) -> Result<LoadedConfig, &'static str> {
     match secret {
         Some(secret) => decrypt(config.trim(), secret),
-        None => parse_plaintext(config),
+        None => parse_plaintext(config, true),
     }
 }
 
-fn parse_plaintext(value: &str) -> Result<ProxyConfig, &'static str> {
+fn parse_plaintext(value: &str, with_environment: bool) -> Result<LoadedConfig, &'static str> {
     let format = if value.trim_start().starts_with('{') {
         config::FileFormat::Json
     } else {
         config::FileFormat::Toml
     };
-    let source = config::Config::builder()
-        .add_source(config::File::from_str(value, format))
-        .add_source(
+    let mut builder = config::Config::builder().add_source(config::File::from_str(value, format));
+    if with_environment {
+        builder = builder.add_source(
             config::Environment::default()
                 .prefix("CLAUDE_PROXY")
                 .separator("__"),
-        )
-        .build()
-        .map_err(|_| "Invalid proxy configuration")?;
+        );
+    }
+    let source = builder.build().map_err(|_| "Invalid proxy configuration")?;
     let explicit_upstream = source.get_string("upstream_url").is_ok();
-    let mut config: ProxyConfig = source
+    let config: ProxyConfig = source
         .try_deserialize()
         .map_err(|_| "Invalid proxy configuration")?;
-    if config.uses_copilot() && !explicit_upstream {
-        config.upstream_url.clear();
-    }
-    Ok(config)
+    Ok(LoadedConfig {
+        config,
+        explicit_upstream,
+    })
 }
 
-fn decrypt(envelope: &str, key: &str) -> Result<ProxyConfig, &'static str> {
+fn decrypt(envelope: &str, key: &str) -> Result<LoadedConfig, &'static str> {
     if envelope.len() > LIMIT || key.len() != 44 {
         return Err(ERROR);
     }
@@ -121,7 +130,7 @@ fn decrypt(envelope: &str, key: &str) -> Result<ProxyConfig, &'static str> {
         .open_in_place(nonce, Aad::from(AAD), ciphertext)
         .map_err(|_| ERROR)?;
     // Never include parsing errors: serde errors can contain decrypted credentials.
-    parse_plaintext(std::str::from_utf8(plaintext).map_err(|_| ERROR)?).map_err(|_| ERROR)
+    parse_plaintext(std::str::from_utf8(plaintext).map_err(|_| ERROR)?, true).map_err(|_| ERROR)
 }
 
 #[cfg(test)]
@@ -143,7 +152,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            config.copilot_pools.unwrap().0["copilot-1"].github[0].token,
+            config.config.copilot_pools.unwrap().0["copilot-1"].github[0].token,
             "fixture-token"
         );
         for value in [b"invalid-json".as_slice(), b"{}", &vec![b' '; LIMIT + 1]] {
@@ -199,15 +208,15 @@ mod tests {
     fn loads_authenticated_config_and_requires_both_settings() {
         let (envelope, key) = seal(br#"{"port":8123,"copilot_pools":{"copilot-1":{"api_key":"fixture-key","github":[{"login":"alice","token":"fixture-token"}]}}}"#, AAD);
         let config = read(&envelope, Some(&key)).unwrap();
-        assert_eq!(config.port, 8123);
+        assert_eq!(config.config.port, 8123);
         assert_eq!(
-            config.copilot_pools.unwrap().0["copilot-1"].api_key,
+            config.config.copilot_pools.unwrap().0["copilot-1"].api_key,
             "fixture-key"
         );
         assert!(read(&envelope, None).is_err());
         assert!(read("{}", Some(&key)).is_err());
         assert!(read("{}", None).is_ok());
-        assert_eq!(read("port = 8124", None).unwrap().port, 8124);
+        assert_eq!(read("port = 8124", None).unwrap().config.port, 8124);
     }
 
     #[test]

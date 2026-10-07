@@ -11,6 +11,8 @@ Invalid, incomplete, or tampered settings prevent startup without logging values
 This hides plaintext in settings. Anyone able to read both secrets can decrypt it.
 
 When `CLAUDE_PROXY_SECRET` (or `--secret`) is present, config must be encrypted.
+Use an environment secret reference for deployment. `--secret` is a local-only
+convenience because command-line arguments can appear in process listings and history.
 Without a secret, config is plaintext JSON or TOML. There is no automatic fallback.
 `CLAUDE_PROXY_CONFIG` contains config directly. `--config FILE` takes precedence
 and reads the same plaintext or encrypted content from a file. Existing command-line
@@ -43,6 +45,7 @@ Example plaintext structure, using placeholders only:
 
 Use `claude-proxy --encrypt-config <private-settings.json>` with JSON on stdin.
 The same Rust binary encrypts and decrypts. No Python dependency is needed.
+Encryption validates only stdin, independently of local environment overrides.
 The output is created with mode 0600 on Unix and is never overwritten. On Windows,
 the file inherits the containing directory's ACL, so use a private directory.
 Keep it outside Git and the Docker build context.

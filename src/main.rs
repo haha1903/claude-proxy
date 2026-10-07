@@ -1,6 +1,7 @@
 mod acme;
 mod auth;
 mod config;
+mod encrypted_config;
 mod copilot_responses;
 mod keyvault;
 mod middleware;
@@ -264,6 +265,7 @@ async fn build_proxy_router(config: &ProxyConfig) -> Result<Router, Box<dyn std:
         upstream_headers: config.upstream_headers.clone(),
         web_search,
         copilot_responses: config.copilot_routing.is_some()
+            || config.copilot_pools.is_some()
             || config.copilot_vault_url.is_some()
             || matches!(
                 config.upstream_auth,
@@ -492,7 +494,10 @@ fn init_logging(
 /// Load configuration with layered precedence: CLI > env > file > defaults
 fn load_config_without_logging(args: &Args) -> Result<ProxyConfig, Box<dyn std::error::Error>> {
     // First, try to load from config file (if available)
-    let file_config = load_config_file(args.config.as_deref())?;
+    let file_config = match encrypted_config::from_env()? {
+        Some(config) => Some(config),
+        None => load_config_file(args.config.as_deref())?,
+    };
 
     // Build the final config by merging layers
     let config = build_config(args, file_config)?;
@@ -660,7 +665,11 @@ fn build_config(
             .as_ref()
             .and_then(|fc| fc.copilot_vault_url.clone()),
     );
-    let upstream_auth = if copilot_routing.is_some() || copilot_vault_url.is_some() {
+    let copilot_pools = file_config.as_ref().and_then(|fc| fc.copilot_pools.clone());
+    let upstream_auth = if copilot_routing.is_some()
+        || copilot_vault_url.is_some()
+        || copilot_pools.is_some()
+    {
         None
     } else {
         Some(build_upstream_auth(
@@ -720,6 +729,7 @@ fn build_config(
         upstream_auth,
         copilot_routing,
         copilot_vault_url,
+        copilot_pools,
         upstream_headers,
         logging,
         tls,

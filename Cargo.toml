@@ -30,6 +30,7 @@ dirs = "6"
 urlencoding = "2.1.3"
 uuid = { version = "1", features = ["v4"] }
 ring = "0.17"
+base64 = "0.22"
 
 # TLS support - use ring crypto provider (no cmake/aws-lc dependency)
 axum-server = { version = "0.7", default-features = false, features = ["tls-rustls-no-provider"] }

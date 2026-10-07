@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use serde::{Deserialize, Deserializer};
@@ -102,6 +102,37 @@ pub struct GithubAccount {
     pub token: String,
 }
 
+#[derive(Clone, Deserialize)]
+#[serde(transparent)]
+pub struct CopilotPools(pub HashMap<String, VaultRecord>);
+
+impl fmt::Debug for CopilotPools {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CopilotPools")
+            .field("count", &self.0.len())
+            .finish()
+    }
+}
+
+impl CopilotPools {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        let mut keys = HashSet::new();
+        if self.0.is_empty()
+            || self.0.iter().any(|(name, record)| {
+                let valid_name = name.strip_prefix("copilot-").is_some_and(|number| {
+                    !number.starts_with('0')
+                        && number.bytes().all(|b| b.is_ascii_digit())
+                        && number.parse::<u32>().is_ok()
+                });
+                !valid_name || !record.validate() || !keys.insert(&record.api_key)
+            })
+        {
+            return Err("Invalid Copilot pools");
+        }
+        Ok(())
+    }
+}
+
 fn default_policy() -> String {
     "session_hash".into()
 }
@@ -153,6 +184,25 @@ where
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn validates_static_pools_without_disclosing_credentials() {
+        let record = serde_json::json!({"api_key":"fixture-key","github":[{"login":"alice","token":"fixture-token"}]});
+        let pools: CopilotPools = serde_json::from_value(serde_json::json!({"copilot-1":record})).unwrap();
+        assert!(pools.validate().is_ok());
+        assert_eq!(format!("{pools:?}"), "CopilotPools { count: 1 }");
+        assert!(CopilotPools(HashMap::new()).validate().is_err());
+        for name in ["other", "copilot-0", "copilot-01", "copilot-", "copilot-x", "copilot-4294967296"] {
+            let invalid = CopilotPools(HashMap::from([(name.into(), pools.0["copilot-1"].clone())]));
+            assert!(invalid.validate().is_err());
+        }
+        let mut invalid = pools.clone();
+        invalid.0.insert("copilot-2".into(), pools.0["copilot-1"].clone());
+        assert!(invalid.validate().is_err());
+        let mut invalid = pools.clone();
+        invalid.0.get_mut("copilot-1").unwrap().github.clear();
+        assert!(invalid.validate().is_err());
+    }
     use crate::config::ProxyConfig;
 
     pub(crate) fn routing() -> CopilotRouting {

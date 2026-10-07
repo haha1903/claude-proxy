@@ -1,3 +1,5 @@
+use base64::{engine::general_purpose::STANDARD, Engine};
+use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
@@ -7,7 +9,7 @@ const ROUTING: &str = r#"{"accounts":[{"name":"one","github_token":"fixture-toke
 
 fn command() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_claude-proxy"));
-    for (name, _) in std::env::vars().filter(|(name, _)| name.starts_with("CLAUDE_PROXY__")) {
+    for (name, _) in std::env::vars().filter(|(name, _)| name.starts_with("CLAUDE_PROXY_")) {
         command.env_remove(name);
     }
     command.env("CLAUDE_PROXY__UPSTREAM_URL", "http://127.0.0.1:1");
@@ -24,12 +26,17 @@ impl Drop for Server {
 
 #[test]
 fn json_secret_environment_supports_startup_without_legacy_credentials() {
+    let mut command = command();
+    command.env("CLAUDE_PROXY__COPILOT_ROUTING", ROUTING);
+    assert_authenticated_startup(command);
+}
+
+fn assert_authenticated_startup(mut command: Command) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     drop(listener);
     let mut server = Server(
-        command()
-            .env("CLAUDE_PROXY__COPILOT_ROUTING", ROUTING)
+        command
             .env("CLAUDE_PROXY__BIND_ADDRESS", "127.0.0.1")
             .env("CLAUDE_PROXY__PORT", address.port().to_string())
             .stdout(Stdio::null())
@@ -58,6 +65,62 @@ fn json_secret_environment_supports_startup_without_legacy_credentials() {
     let mut response = String::new();
     connection.read_to_string(&mut response).unwrap();
     assert!(response.starts_with("HTTP/1.1 401"));
+}
+
+fn encrypted_settings() -> (String, String) {
+    let plaintext = br#"{"upstream_url":"http://127.0.0.1:1","copilot_pools":{"copilot-1":{"api_key":"fixture-client","github":[{"login":"alice","token":"fixture-token"}]}}}"#;
+    let bytes = [7; 32];
+    let nonce = [3; 12];
+    let key = LessSafeKey::new(UnboundKey::new(&AES_256_GCM, &bytes).unwrap());
+    let mut ciphertext = plaintext.to_vec();
+    key.seal_in_place_append_tag(
+        Nonce::assume_unique_for_key(nonce),
+        Aad::from(b"claude-proxy-config-v1"),
+        &mut ciphertext,
+    )
+    .unwrap();
+    (
+        format!(
+            "v1.{}",
+            STANDARD.encode([nonce.to_vec(), ciphertext].concat())
+        ),
+        STANDARD.encode(bytes),
+    )
+}
+
+#[test]
+fn encrypted_settings_boot_without_vault_or_plaintext_credentials() {
+    let (envelope, key) = encrypted_settings();
+    let mut command = command();
+    command
+        .env("CLAUDE_PROXY_ENCRYPTED_CONFIG", envelope)
+        .env("CLAUDE_PROXY_CONFIG_KEY", key);
+    assert_authenticated_startup(command);
+}
+
+#[test]
+fn encrypted_settings_errors_do_not_fall_back_or_disclose_values() {
+    let (envelope, key) = encrypted_settings();
+    for (encrypted, secret) in [
+        (Some(envelope.as_str()), None),
+        (None, Some(key.as_str())),
+        (Some("fixture-secret-invalid"), Some(key.as_str())),
+    ] {
+        let mut command = command();
+        command.env("CLAUDE_PROXY__COPILOT_ROUTING", ROUTING);
+        if let Some(value) = encrypted {
+            command.env("CLAUDE_PROXY_ENCRYPTED_CONFIG", value);
+        }
+        if let Some(value) = secret {
+            command.env("CLAUDE_PROXY_CONFIG_KEY", value);
+        }
+        let output = command.output().unwrap();
+        assert!(!output.status.success());
+        let error = String::from_utf8(output.stderr).unwrap();
+        assert!(error.contains("Invalid encrypted proxy configuration"));
+        assert!(!error.contains("fixture-secret"));
+        assert!(!error.contains(&key));
+    }
 }
 
 #[test]

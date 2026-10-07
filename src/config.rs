@@ -99,6 +99,9 @@ pub struct ProxyConfig {
     #[serde(default)]
     pub copilot_vault_url: Option<String>,
 
+    #[serde(default)]
+    pub copilot_pools: Option<crate::routing::CopilotPools>,
+
     /// Custom headers to add to upstream requests
     #[serde(default)]
     pub upstream_headers: Vec<(String, String)>,

@@ -92,10 +92,23 @@ fn session_id(headers: &HeaderMap) -> Result<Option<&str>, StatusCode> {
 
 impl ApiKeyValidatorState {
     pub fn validate_config(config: &ProxyConfig) -> Result<(), &'static str> {
+        if [
+            config.copilot_vault_url.is_some(),
+            config.copilot_routing.is_some(),
+            config.copilot_pools.is_some(),
+        ]
+        .into_iter()
+        .filter(|configured| *configured)
+        .count()
+            > 1
+        {
+            return Err("Configure only one Copilot routing source");
+        }
+        if let Some(pools) = &config.copilot_pools {
+            pools.validate()?;
+            return crate::routing::validate_headers(&config.upstream_headers);
+        }
         if let Some(url) = &config.copilot_vault_url {
-            if config.copilot_routing.is_some() {
-                return Err("Configure only one Copilot routing source");
-            }
             crate::keyvault::validate_vault_url(url)?;
             crate::routing::validate_headers(&config.upstream_headers)
         } else if let Some(routing) = &config.copilot_routing {
@@ -113,9 +126,12 @@ impl ApiKeyValidatorState {
             clients: Arc::new(SyncRwLock::new(HashMap::new())),
             tokens: Arc::new(SyncRwLock::new(HashMap::new())),
             allow_missing_key: config.copilot_routing.is_none()
+                && config.copilot_pools.is_none()
                 && config.copilot_vault_url.is_none(),
         };
-        if let Some(routing) = &config.copilot_routing {
+        if let Some(pools) = &config.copilot_pools {
+            state.replace_records(&pools.0)?;
+        } else if let Some(routing) = &config.copilot_routing {
             state.replace_copilot(routing)?;
         } else if config.copilot_vault_url.is_none() {
             let auth = create_upstream_auth(config.upstream_auth.as_ref().unwrap());
@@ -277,6 +293,44 @@ mod tests {
 
     fn config() -> ProxyConfig {
         serde_json::from_value(serde_json::json!({})).unwrap()
+    }
+
+    #[test]
+    fn static_pools_preserve_records_and_reject_conflicting_sources() {
+        let mut config: ProxyConfig = serde_json::from_value(serde_json::json!({
+            "copilot_pools": {
+                "copilot-1": {"api_key":"fixture-client", "github":[
+                    {"login":"alice", "token":"fixture-token"}
+                ]},
+                "copilot-5": {"api_key":"fixture-pool", "github":[
+                    {"login":"alice", "token":"fixture-token"},
+                    {"login":"bob", "token":"fixture-token-two"}
+                ]}
+            }
+        })).unwrap();
+        let state = ApiKeyValidatorState::from_config(&config).unwrap();
+        assert!(!state.allow_missing_key);
+        let clients = state.clients.read().unwrap();
+        assert_eq!(clients["fixture-pool"].name, "copilot-5");
+        assert_eq!(clients["fixture-pool"].members.len(), 2);
+        assert!(Arc::ptr_eq(&clients["fixture-client"].members[0].1, &clients["fixture-pool"].members[0].1));
+        let mut headers = HeaderMap::new();
+        assert!(clients["fixture-pool"].select(&headers, &Method::POST, "/responses").is_err());
+        headers.insert("session-id", "session-one".parse().unwrap());
+        let first = clients["fixture-pool"].select(&headers, &Method::POST, "/responses").unwrap();
+        let restarted = ApiKeyValidatorState::from_config(&config).unwrap();
+        let restarted_clients = restarted.clients.read().unwrap();
+        let selected = restarted_clients["fixture-pool"].select(&headers, &Method::POST, "/responses").unwrap();
+        let login = |route: &Route, auth: &Arc<dyn UpstreamAuth>| route.members.iter().find(|(_, a)| Arc::ptr_eq(a, auth)).unwrap().0.clone();
+        assert_eq!(login(&clients["fixture-pool"], &first), login(&restarted_clients["fixture-pool"], &selected));
+        config.copilot_routing = Some(routing());
+        assert!(ApiKeyValidatorState::from_config(&config).is_err());
+        config.copilot_routing = None;
+        config.copilot_vault_url = Some("https://fixture.vault.azure.net/".into());
+        assert!(ApiKeyValidatorState::from_config(&config).is_err());
+        config.copilot_vault_url = None;
+        config.upstream_headers.push(("Authorization".into(), "fixture-secret".into()));
+        assert!(ApiKeyValidatorState::from_config(&config).is_err());
     }
 
     #[test]

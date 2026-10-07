@@ -319,6 +319,7 @@ dependencies = [
  "async-trait",
  "axum",
  "axum-server",
+ "base64",
  "bytes",
  "chrono",
  "clap",

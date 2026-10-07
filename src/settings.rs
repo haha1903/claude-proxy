@@ -102,6 +102,15 @@ fn parse_plaintext(value: &str, with_environment: bool) -> Result<LoadedConfig, 
         );
     }
     let source = builder.build().map_err(|_| "Invalid proxy configuration")?;
+    if !with_environment {
+        let raw: serde_json::Value = source
+            .clone()
+            .try_deserialize()
+            .map_err(|_| "Invalid proxy configuration")?;
+        if contains_environment_reference(&raw) {
+            return Err("Encryption input must use literal values, not environment references");
+        }
+    }
     let explicit_upstream = source.get_string("upstream_url").is_ok();
     let config: ProxyConfig = source
         .try_deserialize()
@@ -110,6 +119,25 @@ fn parse_plaintext(value: &str, with_environment: bool) -> Result<LoadedConfig, 
         config,
         explicit_upstream,
     })
+}
+
+fn contains_environment_reference(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(values) => values.values().any(contains_environment_reference),
+        serde_json::Value::Array(values) => values.iter().any(contains_environment_reference),
+        serde_json::Value::String(value) => value.char_indices().any(|(index, character)| {
+            if character != '$' {
+                return false;
+            }
+            let rest = &value[index + 1..];
+            (rest.starts_with('{') && rest.contains('}'))
+                || rest
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_alphanumeric() || c == '_')
+        }),
+        _ => false,
+    }
 }
 
 fn decrypt(envelope: &str, key: &str) -> Result<LoadedConfig, &'static str> {
@@ -161,6 +189,23 @@ mod tests {
         let mut large: serde_json::Value = serde_json::from_slice(PLAINTEXT).unwrap();
         large["padding"] = serde_json::Value::String("x".repeat(800_000));
         assert!(encrypt(&serde_json::to_vec(&large).unwrap()).is_err());
+    }
+
+    #[test]
+    fn encryption_rejects_environment_references_in_credentials() {
+        for reference in [
+            "${UNSET_FIXTURE_KEY}",
+            "$UNSET_FIXTURE_KEY",
+            "prefix_${KEY}",
+        ] {
+            let mut config: serde_json::Value = serde_json::from_slice(PLAINTEXT).unwrap();
+            config["web_search"] = serde_json::json!({"tavily_api_key": reference});
+            assert!(encrypt(&serde_json::to_vec(&config).unwrap()).is_err());
+        }
+        let mut literal: serde_json::Value = serde_json::from_slice(PLAINTEXT).unwrap();
+        literal["port"] = serde_json::json!(8080);
+        literal["web_search"] = serde_json::json!({"tavily_api_key": "literal$-${UNCLOSED"});
+        assert!(encrypt(&serde_json::to_vec(&literal).unwrap()).is_ok());
     }
 
     #[test]

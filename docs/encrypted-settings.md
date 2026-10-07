@@ -46,6 +46,8 @@ Example plaintext structure, using placeholders only:
 Use `claude-proxy --encrypt-config <private-settings.json>` with JSON on stdin.
 The same Rust binary encrypts and decrypts. No Python dependency is needed.
 Encryption validates only stdin, independently of local environment overrides.
+Use literal values in encryption input. Environment references such as `${VAR}`
+or `$VAR` are rejected so the encrypted configuration is self-contained.
 The output is created with mode 0600 on Unix and is never overwritten. On Windows,
 the file inherits the containing directory's ACL, so use a private directory.
 Keep it outside Git and the Docker build context.

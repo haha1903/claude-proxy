@@ -1,23 +1,14 @@
 # Local Copilot tools
 
-`cx` selects fixed local Codex providers. It does not synchronize with a cloud
-configuration and has no `sync` command. Configure API keys in
-`~/.config/claude-proxy/copilot-clients.json`:
+`cx` reads providers directly from `~/.codex/config.toml` and changes only
+`model_provider`. It preserves addresses, API keys, models, and other settings.
+There is no sync command or separate key configuration file.
 
-```json
-{
-  "schema_version": 1,
-  "entries": [
-    {"number": 1, "api_key": "<first client key>"},
-    {"number": 5, "api_key": "<pool client key>"}
-  ]
-}
-```
-
-Keep this file private. It contains only client API keys, not GitHub tokens.
-The existing `copilot-accounts.json` format remains supported when this file is
-absent. Switching providers preserves unrelated Codex settings and creates a
-private backup. `cx status` and `cx official` work without local proxy keys.
+Use `cx copilot3` to select the existing `model_providers.copilot3` entry,
+`cx official` for OpenAI, and `cx status` to inspect the current default.
+Running `cx` in a terminal opens a menu of configured Copilot providers.
+Switching creates a private backup and verifies the saved configuration.
+New defaults apply after restarting Codex and starting a new chat.
 
 The server's configuration and encryption are handled by the Rust binary.
 See [configuration settings](../docs/encrypted-settings.md). Pool names remain

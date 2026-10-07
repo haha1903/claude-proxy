@@ -33,24 +33,16 @@ class CxTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.config = self.root / '.codex/config.toml'
         self.config.parent.mkdir()
-        self.credentials = self.root / '.config/claude-proxy/copilot-accounts.json'
-        self.credentials.parent.mkdir(parents=True)
         self.key1 = 'fixture-existing-key'
         self.key2 = 'fixture-new-key-"\\$'
         self.key3 = 'fixture-third-key'
-        self.data = {'accounts': {'account1': {'login': 'private-login-one'}, 'account2': {'login': 'private-login-two'},
-                                 'account3': {'login': 'private-login-three'}},
-                     'clients': {'client-current': {'api_key': self.key2, 'account': 'account2'},
-                                 'client-haha1903': {'api_key': self.key1, 'account': 'account1'},
-                                 'client-copilot3': {'api_key': self.key3, 'account': 'account3'}}}
-        self.save_credentials()
         self.config.write_text('''# Keep this comment
 model = "gpt-6-astra"
 model_provider = "copilot-proxy"
 model_reasoning_effort = "xhigh"
 
 [model_providers.copilot-proxy]
-name = "Copilot Proxy"
+name = "Copilot 1"
 base_url = "https://example.invalid"
 experimental_bearer_token = "fixture-existing-key"
 
@@ -58,11 +50,12 @@ experimental_bearer_token = "fixture-existing-key"
 [projects."/example"]
 trust_level = "trusted"
 ''')
+        with self.config.open('a') as handle:
+            for number, key in enumerate([self.key1, self.key2, self.key3], 1):
+                handle.write(f'\n[model_providers.copilot{number}]\nname = "Copilot {number}"\nbase_url = "https://example.invalid"\nexperimental_bearer_token = {json.dumps(key)}\n')
         self.original = self.config.read_bytes()
         self.parsed = self.read_config()
 
-    def save_credentials(self):
-        self.credentials.write_text(json.dumps(self.data))
 
     def read_config(self):
         return tomllib.loads(self.config.read_text())
@@ -82,10 +75,6 @@ trust_level = "trusted"
         expected = copy.deepcopy(self.parsed)
         selection = {self.key1: 'copilot1', self.key2: 'copilot2', self.key3: 'copilot3'}[key]
         expected.update(model_provider=provider or selection, model='gpt-6-astra')
-        template = self.parsed['model_providers']['copilot-proxy']
-        for name, label, value in [('copilot-proxy', 'Copilot 1', self.key1), ('copilot1', 'Copilot 1', self.key1),
-                                    ('copilot2', 'Copilot 2', self.key2), ('copilot3', 'Copilot 3', self.key3)]:
-            expected['model_providers'][name] = {**template, 'name': label, 'experimental_bearer_token': value}
         self.assertEqual(self.read_config(), expected)
         self.assertIn('# Keep this comment', self.config.read_text())
         self.assertIn('# Keep this table', self.config.read_text())
@@ -127,11 +116,6 @@ trust_level = "trusted"
         self.assertEqual(self.invoke([], terminal='1\n')[0], 0)
         self.assert_switched(self.key1, 'openai')
 
-    def test_same_key_repairs_generic_provider_display_name(self):
-        self.assertEqual(self.invoke(['copilot1'])[0], 0)
-        self.assertEqual(self.read_config()['model_providers']['copilot-proxy']['name'], 'Copilot 1')
-        self.assert_switched(self.key1)
-        self.assertIn('Already using', self.invoke(['copilot1'])[1])
 
     def test_menu_status_cancel_blank_eof_and_interrupt_do_not_write(self):
         for text in ['5\n', '0\n', '\n', '']:
@@ -163,17 +147,6 @@ trust_level = "trusted"
                 self.assertIn('Configured proxy: Copilot 3', self.invoke(['status'])[1])
                 self.assertIn('Already using', self.invoke(['copilot3'])[1])
 
-    def test_third_proxy_rejects_missing_duplicate_and_unknown_binding(self):
-        for mutation in ['missing', 'duplicate', 'unknown']:
-            with self.subTest(mutation=mutation):
-                original = copy.deepcopy(self.data)
-                if mutation == 'missing': del self.data['clients']['client-copilot3']
-                if mutation == 'duplicate': self.data['clients']['client-copilot3']['api_key'] = self.key1
-                if mutation == 'unknown': self.data['clients']['client-copilot3']['account'] = 'missing'
-                self.save_credentials()
-                self.assertEqual(self.invoke(['copilot3'])[0], 1)
-                self.assertEqual(self.config.read_bytes(), self.original)
-                self.data = original
 
     def test_usage_and_bad_arguments_do_not_write(self):
         for args in [['--help'], ['-h']]:
@@ -182,26 +155,6 @@ trust_level = "trusted"
             self.assertEqual(self.invoke(args)[0], 2)
         self.assertEqual(self.config.read_bytes(), self.original)
 
-    def test_missing_and_malformed_credential_source_fail_without_write(self):
-        self.credentials.unlink()
-        self.assertEqual(self.invoke(['copilot2'])[0], 1)
-        self.assertIn('unavailable', self.invoke(['status'])[1])
-        self.credentials.write_text('not-json')
-        self.assertEqual(self.invoke(['copilot2'])[0], 1)
-        self.assertEqual(self.config.read_bytes(), self.original)
-
-    def test_invalid_duplicate_or_unknown_binding_fails_without_write(self):
-        for mutation in ['missing', 'invalid', 'duplicate', 'unknown']:
-            with self.subTest(mutation=mutation):
-                original = copy.deepcopy(self.data)
-                if mutation == 'missing': del self.data['clients']['client-current']
-                if mutation == 'invalid': self.data['clients']['client-current']['api_key'] = 'bad\nkey'
-                if mutation == 'duplicate': self.data['clients']['client-current']['api_key'] = self.key1
-                if mutation == 'unknown': self.data['clients']['client-current']['account'] = 'unknown'
-                self.save_credentials()
-                self.assertEqual(self.invoke(['copilot2'])[0], 1)
-                self.assertEqual(self.config.read_bytes(), self.original)
-                self.data = original
 
     def test_missing_config_and_invalid_toml(self):
         self.config.unlink()
@@ -213,22 +166,8 @@ trust_level = "trusted"
         self.config.write_text('# Empty settings\n')
         self.assertEqual(self.invoke(['copilot1'])[0], 1)
         self.assertEqual(self.invoke(['official'])[0], 0)
-        self.assertEqual(self.read_config(), {'model': 'gpt-6-astra', 'model_provider': 'openai'})
+        self.assertEqual(self.read_config(), {'model_provider': 'openai'})
 
-    def test_inserts_token_into_quoted_table(self):
-        for quote in ['"', "'"]:
-            self.config.write_text(f'''[model_providers.{quote}copilot-proxy{quote}] # preserve
-base_url = "https://example.invalid"
-''')
-            self.assertEqual(self.invoke(['copilot2'])[0], 0)
-            self.assertEqual(self.read_config()['model_providers']['copilot-proxy']['experimental_bearer_token'], self.key1)
-            self.assertEqual(self.read_config()['model_providers']['copilot2']['experimental_bearer_token'], self.key2)
-
-    def test_additional_auth_rejected(self):
-        self.config.write_text(self.original.decode().replace('name = "Copilot Proxy"', 'env_key = "OTHER_AUTH"\nname = "Copilot Proxy"'))
-        before = self.config.read_bytes()
-        self.assertEqual(self.invoke(['copilot2'])[0], 1)
-        self.assertEqual(self.config.read_bytes(), before)
 
     def test_unrecognized_table_layout_fails_closed(self):
         self.config.write_text('[model_providers]\ncopilot-proxy = { base_url = "https://example.invalid" }\n')
@@ -237,7 +176,7 @@ base_url = "https://example.invalid"
         self.assertEqual(self.config.read_bytes(), before)
 
     def test_validation_rejects_changes_inside_multiline_strings(self):
-        self.config.write_text('description = """\nmodel = not a setting\n"""\n' + self.original.decode())
+        self.config.write_text('description = """\nmodel_provider = not a setting\n"""\n' + self.original.decode())
         before = self.config.read_bytes()
         self.assertEqual(self.invoke(['copilot2'])[0], 1)
         self.assertEqual(self.config.read_bytes(), before)
@@ -269,19 +208,6 @@ base_url = "https://example.invalid"
         for selection in ['copilot1', 'copilot2', 'official', 'copilot3']:
             self.assertEqual(self.invoke([selection])[0], 0)
             self.assertEqual(self.read_config()['model_providers'], providers)
-
-    def test_old_shared_key_is_pinned_to_copilot1(self):
-        self.config.write_text(self.original.decode().replace('fixture-existing-key', self.key3))
-        self.assertEqual(self.invoke(['copilot3'])[0], 0)
-        self.assert_switched(self.key3)
-
-    def test_existing_provider_conflicts_fail_without_writing(self):
-        for extra in ['base_url = "https://unrelated.invalid"',
-                      'base_url = "https://example.invalid"\nenv_key = "OTHER_AUTH"']:
-            self.config.write_text(self.original.decode() + '\n[model_providers.copilot3]\n' + extra + '\n')
-            before = self.config.read_bytes()
-            self.assertEqual(self.invoke(['copilot3'])[0], 1)
-            self.assertEqual(self.config.read_bytes(), before)
 
 
 if __name__ == '__main__':

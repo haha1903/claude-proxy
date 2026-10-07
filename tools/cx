@@ -11,17 +11,9 @@ import time
 import tomllib
 from pathlib import Path
 
-PROXY = "copilot-proxy"
-MODEL = "gpt-6-astra"
-PROXIES = {"copilot1": ("Copilot 1", "client-haha1903"), "copilot2": ("Copilot 2", "client-current"),
-           "copilot3": ("Copilot 3", "client-copilot3")}
-LOCAL_KEYS = None
-ALIASES = {"proxy1": "copilot1", "proxy2": "copilot2", "proxy3": "copilot3"}
 USAGE = """Usage: cx [official|copilot<N>|status]
-Configure fixed API keys in ~/.config/claude-proxy/copilot-clients.json.
-The menu and provider switching only read local configuration.
-Switches defaults for new Codex sessions. Each Copilot provider keeps a fixed key.
-The legacy copilot-proxy provider and cx copilot use Copilot 1.
+Reads providers directly from ~/.codex/config.toml.
+Only switches model_provider. Provider addresses, keys, and other settings stay unchanged.
 """
 
 
@@ -29,69 +21,22 @@ class ConfigError(Exception):
     pass
 
 
-def cache_path():
-    return Path.home() / ".config/claude-proxy/copilot-clients.json"
-
-
-def discover():
-    global PROXIES, ALIASES
-    path = cache_path()
-    if not path.exists():
-        return None
-    try:
-        data = json.loads(path.read_text())
-        if data["schema_version"] != 1 or not isinstance(data["entries"], list):
-            raise ValueError()
-        keys = {}
-        for entry in data["entries"]:
-            number, key = entry["number"], entry["api_key"]
-            if type(number) is not int or not 1 <= number <= 4294967295:
-                raise ValueError()
-            if not isinstance(key, str) or not key or not all(33 <= ord(c) <= 126 for c in key):
-                raise ValueError()
-            name = f"copilot{number}"
-            if name in keys or key in keys.values():
-                raise ValueError()
-            keys[name] = key
-        keys = dict(sorted(keys.items(), key=lambda item: int(item[0][7:])))
-        PROXIES = {name: ("Copilot " + name[7:], "copilot-" + name[7:]) for name in keys}
-        ALIASES = {"proxy" + name[7:]: name for name in keys}
-        return keys
-    except (OSError, ValueError, KeyError, TypeError):
-        raise ConfigError("Copilot local configuration is invalid. Edit copilot-clients.json.") from None
-
-
-def proxy_keys():
-    if LOCAL_KEYS is not None:
-        return LOCAL_KEYS
-    path = Path.home() / ".config/claude-proxy/copilot-accounts.json"
-    try:
-        data = json.loads(path.read_text())
-        accounts, clients = data["accounts"], data["clients"]
-        result = {}
-        for selection, (label, client_id) in PROXIES.items():
-            client = clients[client_id]
-            key = client.get("api_key")
-            if not isinstance(key, str) or not key or not all(33 <= ord(c) <= 126 for c in key):
-                raise ConfigError(f"Missing or invalid client key for {label}.")
-            if client.get("account") not in accounts:
-                raise ConfigError(f"Unknown account binding for {label}.")
-            result[selection] = key
-        if len(set(result.values())) != len(result):
-            raise ConfigError("Proxy options must use different client keys.")
-        return result
-    except (OSError, ValueError, KeyError, TypeError, AttributeError):
-        raise ConfigError(f"Cannot read proxy key configuration: {path}") from None
+def discover(config):
+    providers = config.get("model_providers", {})
+    if not isinstance(providers, dict):
+        raise ConfigError("model_providers must be a table in config.toml.")
+    names = sorted((name for name in providers if re.fullmatch(r"copilot[1-9][0-9]*", name)),
+                   key=lambda name: int(name[7:]))
+    return {name: providers[name].get("name", "Copilot " + name[7:]) for name in names
+            if isinstance(providers[name], dict)}
 
 
 def show_status(config):
-    entry = config.get("model_providers", {}).get(config.get("model_provider", "openai"), {})
-    try:
-        label = next((PROXIES[selection][0] for selection, key in proxy_keys().items()
-                      if key == entry.get("experimental_bearer_token")),
-                     entry.get("name", "unknown") + " (saved configuration)")
-    except ConfigError:
-        label = "unknown (proxy key configuration unavailable)"
+    providers = config.get("model_providers", {})
+    entry = providers.get(config.get("model_provider", "openai"), {}) if isinstance(providers, dict) else {}
+    if not isinstance(entry, dict):
+        entry = {}
+    label = entry.get("name", config.get("model_provider", "openai"))
     print("Provider:", config.get("model_provider", "openai"))
     print("Model:", config.get("model", "(default)"))
     print("Configured proxy:", label)
@@ -100,12 +45,13 @@ def show_status(config):
 
 def choose_mode(config):
     show_status(config)
+    proxies = discover(config)
     choices = {"0": None, "": None, "1": "official"}
     print("\n1) Official OpenAI")
-    for index, (provider, (label, _)) in enumerate(PROXIES.items(), 2):
+    for index, (provider, label) in enumerate(proxies.items(), 2):
         print(f"{index}) {label}")
         choices[str(index)] = provider
-    last = str(len(PROXIES) + 2)
+    last = str(len(proxies) + 2)
     print(f"{last}) Status\n0) Cancel")
     choices[last] = "status"
     while True:
@@ -123,61 +69,17 @@ def replace_setting(source, key, value):
     return replacement + "\n" + source
 
 
-def provider_block(tables, provider):
-    name = re.escape(provider)
-    header = re.search(rf'''(?m)^[ \t]*\[model_providers\.(?:{name}|"{name}"|'{name}')\][ \t]*(?:\#.*)?$''', tables)
-    if not header:
-        raise ConfigError(f"Cannot locate the {provider} table without changing other configuration.")
-    start = header.end()
-    next_table = re.search(r"(?m)^[ \t]*\[", tables[start:])
-    end = start + next_table.start() if next_table else len(tables)
-    return start, end, tables[start:end].lstrip("\n")
-
-
-def configure_proxies(tables, expected):
-    providers = expected["model_providers"]
-    template = copy.deepcopy(providers[PROXY])
-    _, _, template_body = provider_block(tables, PROXY)
-    keys = proxy_keys()
-    for provider, selection in ([(PROXY, "copilot1")] if "copilot1" in PROXIES else []) + [(name, name) for name in PROXIES]:
-        entry = providers.get(provider, copy.deepcopy(template))
-        if entry.get("base_url") != template["base_url"]:
-            raise ConfigError(f"Provider {provider} points to a different endpoint.")
-        if any(entry.get(field) for field in ("auth", "env_key", "http_headers", "env_http_headers", "requires_openai_auth")):
-            raise ConfigError(f"Provider {provider} has additional authentication settings.")
-        exists = provider in providers
-        if exists:
-            start, end, body = provider_block(tables, provider)
-        else:
-            body = template_body
-        label = PROXIES[selection][0]
-        body = replace_setting(body, "experimental_bearer_token", keys[selection])
-        body = replace_setting(body, "name", label)
-        if exists:
-            tables = tables[:start] + "\n" + body + tables[end:]
-        else:
-            tables = tables.rstrip() + f"\n\n[model_providers.{provider}]\n" + body.rstrip() + "\n"
-        entry.update(name=label, experimental_bearer_token=keys[selection])
-        providers[provider] = entry
-    return tables
-
-
-def switch_config(path, original, config, mode, selection):
-    provider = "openai" if mode == "official" else selection
-    entry = config.get("model_providers", {}).get(PROXY, {})
-    if selection and not entry.get("base_url"):
-        raise ConfigError("Missing model_providers.copilot-proxy configuration.")
-    label = PROXIES[selection][0] if selection else None
+def switch_config(path, original, config, provider):
+    if provider != "openai":
+        if provider not in discover(config) or not config["model_providers"][provider].get("base_url"):
+            raise ConfigError(f"Missing {provider} provider configuration in config.toml.")
     source = original.decode()
     first_table = re.search(r"(?m)^[ \t]*\[", source)
     end = first_table.start() if first_table else len(source)
     root, tables = source[:end], source[end:]
     expected = copy.deepcopy(config)
-    for name, value in [("model_provider", provider), ("model", MODEL)]:
-        root = replace_setting(root, name, value)
-    expected.update(model_provider=provider, model=MODEL)
-    if selection:
-        tables = configure_proxies(tables, expected)
+    root = replace_setting(root, "model_provider", provider)
+    expected["model_provider"] = provider
 
     updated = (root + tables).encode()
     try:
@@ -187,7 +89,7 @@ def switch_config(path, original, config, mode, selection):
     if not valid:
         raise ConfigError("Validation failed: unrelated configuration would change.")
     if updated == original:
-        print(f"Already using {provider}" + (f" / {label}" if selection else "") + f" / {MODEL}.")
+        print(f"Already using {provider}.")
         return
     if path.read_bytes() != original:
         raise ConfigError("Codex configuration changed while selecting. Run cx again.")
@@ -206,10 +108,10 @@ def switch_config(path, original, config, mode, selection):
             os.unlink(temporary)
     if tomllib.loads(path.read_text()) != expected:
         raise ConfigError("Configuration readback did not match the selected settings.")
-    print(f"Switched to {provider}" + (f" / {label}" if selection else "") + f" / {MODEL}.")
+    print(f"Switched to {provider}.")
     print(f"Backup: {backup}")
     print("Restart Codex and start a new chat to use these defaults.")
-    print("Provider keys stay fixed. Legacy copilot-proxy chats use Copilot 1.")
+    print("Provider addresses, keys, and model settings were preserved.")
 
 
 def main(args=None):
@@ -217,19 +119,10 @@ def main(args=None):
     if args in (["-h"], ["--help"]):
         print(USAGE, end="")
         return 0
-    global LOCAL_KEYS, PROXIES
-    LOCAL_KEYS = None
-    if args not in (["official"], ["status"]):
-        try:
-            LOCAL_KEYS = discover()
-        except ConfigError as error:
-            print(str(error), file=sys.stderr)
-            if args:
-                return 1
-            LOCAL_KEYS, PROXIES = {}, {}
-    args = [ALIASES.get(arg, arg) for arg in args]
-    if args and not (len(args) == 1 and args[0] in {"official", "copilot", "status", *PROXIES}
-                     or len(args) == 2 and args[0] == "copilot" and args[1] in PROXIES):
+    args = ["copilot" + arg[5:] if re.fullmatch(r"proxy[1-9][0-9]*", arg) else arg for arg in args]
+    valid = lambda value: value in {"official", "copilot", "status"} or re.fullmatch(r"copilot[1-9][0-9]*", value)
+    if args and not (len(args) == 1 and valid(args[0])
+                     or len(args) == 2 and args[0] == "copilot" and re.fullmatch(r"copilot[1-9][0-9]*", args[1])):
         print(USAGE, file=sys.stderr, end="")
         return 2
     path = Path.home() / ".codex/config.toml"
@@ -253,14 +146,11 @@ def main(args=None):
             mode = args[-1]
         if mode == "copilot":
             mode = "copilot1"
-        if mode == "copilot1" and mode not in PROXIES:
-            raise ConfigError("Copilot 1 is unavailable in local configuration.")
         if mode == "status":
             show_status(config)
             print("These are defaults; existing chats may keep their previous provider and account history.")
         else:
-            selection = mode if mode in PROXIES else None
-            switch_config(path, original, config, mode, selection)
+            switch_config(path, original, config, "openai" if mode == "official" else mode)
         return 0
     except (EOFError, KeyboardInterrupt):
         print("\nCancelled. Configuration unchanged.")

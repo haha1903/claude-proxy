@@ -27,22 +27,11 @@ class ReviewRegressions(unittest.TestCase):
             home=Path(temp);(home/'.codex').mkdir()
             config=home/'.codex/config.toml'
             config.write_text('model_provider = "copilot3"\nmodel = "gpt-6-astra"\n')
-            with patch.object(Path,'home',return_value=home),patch.object(cx,'discover',side_effect=cx.ConfigError('Local configuration unavailable')) as discover,contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()):
+            with patch.object(Path,'home',return_value=home),contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()):
                 self.assertEqual(cx.main(['status']),0)
                 self.assertEqual(cx.main(['official']),0)
-                discover.assert_not_called()
                 self.assertEqual(cx.main(['copilot3']),1)
             self.assertIn('model_provider = "openai"',config.read_text())
-
-
-
-    def test_invalid_cache_cannot_supply_credentials(self):
-        with tempfile.TemporaryDirectory() as temp,patch.object(Path,'home',return_value=Path(temp)):
-            path=cx.cache_path();path.parent.mkdir(parents=True)
-            for data in [{}, {'schema_version':2,'entries':[]},{'schema_version':1,'entries':{}},{'schema_version':1,'entries':[{'number':True,'api_key':'key'}]},{'schema_version':1,'entries':[{'number':1,'api_key':'bad key'}]},{'schema_version':1,'entries':[{'number':1,'api_key':'key'},{'number':2,'api_key':'key'}]}]:
-                path.write_text(json.dumps(data))
-                with self.assertRaises(cx.ConfigError):cx.discover()
-
 
 
     def test_missing_vault_configuration_does_not_restore_legacy_identities(self):

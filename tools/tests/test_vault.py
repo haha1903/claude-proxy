@@ -118,25 +118,5 @@ class ConsumerTests(unittest.TestCase):
         self.assertFalse(report['ok']);self.assertEqual(report['accounts'],[])
         self.assertEqual(report['discovery_errors'],[{'code':'vault_http_403'}])
         self.assertIn('vault_http_403',usage.human_summary(report))
-    def test_manual_sync_caches_only_client_keys_and_offline_discovery(self):
-        with tempfile.TemporaryDirectory() as temp, patch.object(Path,'home',return_value=Path(temp)), patch.object(cx,'vault_loader',return_value=self.loader), patch.object(cx,'PROXIES',cx.PROXIES.copy()), patch.object(cx,'ALIASES',cx.ALIASES.copy()), contextlib.redirect_stdout(io.StringIO()):
-            cx.sync_cache()
-            cached=cx.cache_path().read_text()
-            self.assertNotIn('github-fixture',cached)
-            self.assertNotIn('alice',cached)
-            self.assertEqual(cx.cache_path().stat().st_mode & 0o777,0o600)
-            self.loader.load_records.reset_mock()
-            keys=cx.discover()
-            self.assertEqual(keys,{'copilot1':'client-fixture','copilot5':'pool-key'})
-            self.assertEqual(cx.PROXIES['copilot5'][0],'Copilot 5')
-            self.assertEqual(cx.ALIASES['proxy5'],'copilot5')
-            self.loader.load_records.assert_not_called()
-            self.loader.load_records.return_value['errors']=[{'code':'vault_record_invalid'}]
-            with self.assertRaises(cx.ConfigError):cx.sync_cache()
-            self.assertEqual(cx.cache_path().read_text(),cached)
-            self.loader.load_records.side_effect=OSError('secret')
-            with self.assertRaises(cx.ConfigError) as caught:cx.sync_cache()
-            self.assertNotIn('secret',str(caught.exception))
-            self.assertEqual(cx.cache_path().read_text(),cached)
 
 if __name__=='__main__':unittest.main()

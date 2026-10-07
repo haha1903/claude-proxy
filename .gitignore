@@ -6,3 +6,4 @@ AGENTS.md
 hint.md
 .claude
 .env*
+__pycache__/

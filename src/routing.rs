@@ -88,7 +88,7 @@ fn valid_credential(value: &str) -> bool {
 
 #[derive(Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
-pub struct VaultRecord {
+pub struct CopilotPool {
     pub api_key: String,
     #[serde(default = "default_policy")]
     pub policy: String,
@@ -104,7 +104,7 @@ pub struct GithubAccount {
 
 #[derive(Clone, Deserialize)]
 #[serde(transparent)]
-pub struct CopilotPools(pub HashMap<String, VaultRecord>);
+pub struct CopilotPools(pub HashMap<String, CopilotPool>);
 
 impl fmt::Debug for CopilotPools {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -137,7 +137,7 @@ fn default_policy() -> String {
     "session_hash".into()
 }
 
-impl VaultRecord {
+impl CopilotPool {
     pub fn validate(&self) -> bool {
         let mut identities = HashSet::new();
         valid_credential(&self.api_key)
@@ -188,16 +188,27 @@ pub(crate) mod tests {
     #[test]
     fn validates_static_pools_without_disclosing_credentials() {
         let record = serde_json::json!({"api_key":"fixture-key","github":[{"login":"alice","token":"fixture-token"}]});
-        let pools: CopilotPools = serde_json::from_value(serde_json::json!({"copilot-1":record})).unwrap();
+        let pools: CopilotPools =
+            serde_json::from_value(serde_json::json!({"copilot-1":record})).unwrap();
         assert!(pools.validate().is_ok());
         assert_eq!(format!("{pools:?}"), "CopilotPools { count: 1 }");
         assert!(CopilotPools(HashMap::new()).validate().is_err());
-        for name in ["other", "copilot-0", "copilot-01", "copilot-", "copilot-x", "copilot-4294967296"] {
-            let invalid = CopilotPools(HashMap::from([(name.into(), pools.0["copilot-1"].clone())]));
+        for name in [
+            "other",
+            "copilot-0",
+            "copilot-01",
+            "copilot-",
+            "copilot-x",
+            "copilot-4294967296",
+        ] {
+            let invalid =
+                CopilotPools(HashMap::from([(name.into(), pools.0["copilot-1"].clone())]));
             assert!(invalid.validate().is_err());
         }
         let mut invalid = pools.clone();
-        invalid.0.insert("copilot-2".into(), pools.0["copilot-1"].clone());
+        invalid
+            .0
+            .insert("copilot-2".into(), pools.0["copilot-1"].clone());
         assert!(invalid.validate().is_err());
         let mut invalid = pools.clone();
         invalid.0.get_mut("copilot-1").unwrap().github.clear();

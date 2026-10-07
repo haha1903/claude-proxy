@@ -15,11 +15,11 @@ PROXY = "copilot-proxy"
 MODEL = "gpt-6-astra"
 PROXIES = {"copilot1": ("Copilot 1", "client-haha1903"), "copilot2": ("Copilot 2", "client-current"),
            "copilot3": ("Copilot 3", "client-copilot3")}
-VAULT_KEYS = None
+LOCAL_KEYS = None
 ALIASES = {"proxy1": "copilot1", "proxy2": "copilot2", "proxy3": "copilot3"}
-USAGE = """Usage: cx [sync|official|copilot<N>|status]
-Run cx sync to refresh keys and providers from Key Vault.
-The menu and provider switching use the local cache without network access.
+USAGE = """Usage: cx [official|copilot<N>|status]
+Configure fixed API keys in ~/.config/claude-proxy/copilot-clients.json.
+The menu and provider switching only read local configuration.
 Switches defaults for new Codex sessions. Each Copilot provider keeps a fixed key.
 The legacy copilot-proxy provider and cx copilot use Copilot 1.
 """
@@ -29,53 +29,14 @@ class ConfigError(Exception):
     pass
 
 
-def vault_loader():
-    import importlib.util
-    path = Path(__file__).resolve().parent / "copilot_vault.py"
-    if not path.exists():
-        path = Path.home() / ".local/lib/copilot-vault/copilot_vault.py"
-    spec = importlib.util.spec_from_file_location("copilot_vault", path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
 def cache_path():
     return Path.home() / ".config/claude-proxy/copilot-clients.json"
-
-
-def sync_cache():
-    try:
-        result = vault_loader().load_records()
-        if result["errors"]:
-            raise ConfigError("Key Vault contains unavailable records. Local cache was not changed.")
-        data = {"schema_version": 1, "synced_at": int(time.time()), "entries": [
-            {"number": r["number"], "api_key": r["api_key"]} for r in result["records"]
-        ]}
-        path = cache_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fd, temporary = tempfile.mkstemp(prefix=".copilot-sync-", dir=path.parent)
-        try:
-            with os.fdopen(fd, "w") as handle:
-                json.dump(data, handle)
-                handle.write("\n")
-            os.replace(temporary, path)
-        finally:
-            if os.path.exists(temporary):
-                os.unlink(temporary)
-        if json.loads(path.read_text()) != data:
-            raise ConfigError("Copilot cache readback did not match the synchronized values.")
-        print(f"Synchronized {len(data['entries'])} Copilot entries. GitHub tokens were not cached.")
-    except ConfigError:
-        raise
-    except Exception:
-        raise ConfigError("Cannot synchronize Key Vault. Check Azure sign-in and Vault access.") from None
 
 
 def discover():
     global PROXIES, ALIASES
     path = cache_path()
-    if not path.exists() and not (Path.home() / ".config/claude-proxy/key-vault.json").exists():
+    if not path.exists():
         return None
     try:
         data = json.loads(path.read_text())
@@ -97,12 +58,12 @@ def discover():
         ALIASES = {"proxy" + name[7:]: name for name in keys}
         return keys
     except (OSError, ValueError, KeyError, TypeError):
-        raise ConfigError("Copilot cache is missing or invalid. Run cx sync.") from None
+        raise ConfigError("Copilot local configuration is invalid. Edit copilot-clients.json.") from None
 
 
 def proxy_keys():
-    if VAULT_KEYS is not None:
-        return VAULT_KEYS
+    if LOCAL_KEYS is not None:
+        return LOCAL_KEYS
     path = Path.home() / ".config/claude-proxy/copilot-accounts.json"
     try:
         data = json.loads(path.read_text())
@@ -126,11 +87,9 @@ def proxy_keys():
 def show_status(config):
     entry = config.get("model_providers", {}).get(config.get("model_provider", "openai"), {})
     try:
-        if not VAULT_KEYS and (Path.home() / ".config/claude-proxy/key-vault.json").exists():
-            label = entry.get("name", "unknown") + " (saved configuration)"
-        else:
-            label = next((PROXIES[selection][0] for selection, key in proxy_keys().items()
-                          if key == entry.get("experimental_bearer_token")), "unknown")
+        label = next((PROXIES[selection][0] for selection, key in proxy_keys().items()
+                      if key == entry.get("experimental_bearer_token")),
+                     entry.get("name", "unknown") + " (saved configuration)")
     except ConfigError:
         label = "unknown (proxy key configuration unavailable)"
     print("Provider:", config.get("model_provider", "openai"))
@@ -204,26 +163,20 @@ def configure_proxies(tables, expected):
 
 
 def switch_config(path, original, config, mode, selection):
-    provider = config.get("model_provider", "openai") if mode == "sync" else ("openai" if mode == "official" else selection)
+    provider = "openai" if mode == "official" else selection
     entry = config.get("model_providers", {}).get(PROXY, {})
-    if (selection or mode == "sync") and not entry.get("base_url"):
+    if selection and not entry.get("base_url"):
         raise ConfigError("Missing model_providers.copilot-proxy configuration.")
     label = PROXIES[selection][0] if selection else None
-    if mode == "sync":
-        default_entry = "copilot1" if provider == PROXY else provider
-        if re.fullmatch(r"copilot[1-9][0-9]*", default_entry) and default_entry not in PROXIES:
-            print(f"Default provider {provider} is absent from synchronized entries. Select an available provider before starting a new chat.", file=sys.stderr)
-
     source = original.decode()
     first_table = re.search(r"(?m)^[ \t]*\[", source)
     end = first_table.start() if first_table else len(source)
     root, tables = source[:end], source[end:]
     expected = copy.deepcopy(config)
-    if mode != "sync":
-        for name, value in [("model_provider", provider), ("model", MODEL)]:
-            root = replace_setting(root, name, value)
-        expected.update(model_provider=provider, model=MODEL)
-    if selection or mode == "sync":
+    for name, value in [("model_provider", provider), ("model", MODEL)]:
+        root = replace_setting(root, name, value)
+    expected.update(model_provider=provider, model=MODEL)
+    if selection:
         tables = configure_proxies(tables, expected)
 
     updated = (root + tables).encode()
@@ -234,10 +187,7 @@ def switch_config(path, original, config, mode, selection):
     if not valid:
         raise ConfigError("Validation failed: unrelated configuration would change.")
     if updated == original:
-        if mode == "sync":
-            print("Copilot providers already match the synchronized cache. Defaults unchanged.")
-        else:
-            print(f"Already using {provider}" + (f" / {label}" if selection else "") + f" / {MODEL}.")
+        print(f"Already using {provider}" + (f" / {label}" if selection else "") + f" / {MODEL}.")
         return
     if path.read_bytes() != original:
         raise ConfigError("Codex configuration changed while selecting. Run cx again.")
@@ -256,10 +206,7 @@ def switch_config(path, original, config, mode, selection):
             os.unlink(temporary)
     if tomllib.loads(path.read_text()) != expected:
         raise ConfigError("Configuration readback did not match the selected settings.")
-    if mode == "sync":
-        print(f"Updated Copilot providers. Default remains {provider}.")
-    else:
-        print(f"Switched to {provider}" + (f" / {label}" if selection else "") + f" / {MODEL}.")
+    print(f"Switched to {provider}" + (f" / {label}" if selection else "") + f" / {MODEL}.")
     print(f"Backup: {backup}")
     print("Restart Codex and start a new chat to use these defaults.")
     print("Provider keys stay fixed. Legacy copilot-proxy chats use Copilot 1.")
@@ -270,20 +217,18 @@ def main(args=None):
     if args in (["-h"], ["--help"]):
         print(USAGE, end="")
         return 0
-    global VAULT_KEYS, PROXIES
-    VAULT_KEYS = None
+    global LOCAL_KEYS, PROXIES
+    LOCAL_KEYS = None
     if args not in (["official"], ["status"]):
         try:
-            if args == ["sync"]:
-                sync_cache()
-            VAULT_KEYS = discover()
+            LOCAL_KEYS = discover()
         except ConfigError as error:
             print(str(error), file=sys.stderr)
             if args:
                 return 1
-            VAULT_KEYS, PROXIES = {}, {}
+            LOCAL_KEYS, PROXIES = {}, {}
     args = [ALIASES.get(arg, arg) for arg in args]
-    if args and not (len(args) == 1 and args[0] in {"official", "copilot", "status", "sync", *PROXIES}
+    if args and not (len(args) == 1 and args[0] in {"official", "copilot", "status", *PROXIES}
                      or len(args) == 2 and args[0] == "copilot" and args[1] in PROXIES):
         print(USAGE, file=sys.stderr, end="")
         return 2
@@ -309,7 +254,7 @@ def main(args=None):
         if mode == "copilot":
             mode = "copilot1"
         if mode == "copilot1" and mode not in PROXIES:
-            raise ConfigError("Copilot 1 is unavailable in Key Vault.")
+            raise ConfigError("Copilot 1 is unavailable in local configuration.")
         if mode == "status":
             show_status(config)
             print("These are defaults; existing chats may keep their previous provider and account history.")

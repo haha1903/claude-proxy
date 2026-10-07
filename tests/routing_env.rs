@@ -89,12 +89,12 @@ fn encrypted_settings() -> (String, String) {
 }
 
 #[test]
-fn encrypted_settings_boot_without_vault_or_plaintext_credentials() {
+fn encrypted_settings_boot_without_plaintext_credentials() {
     let (envelope, key) = encrypted_settings();
     let mut command = command();
     command
-        .env("CLAUDE_PROXY_ENCRYPTED_CONFIG", envelope)
-        .env("CLAUDE_PROXY_CONFIG_KEY", key);
+        .env("CLAUDE_PROXY_CONFIG", envelope)
+        .env("CLAUDE_PROXY_SECRET", key);
     assert_authenticated_startup(command);
 }
 
@@ -109,15 +109,15 @@ fn encrypted_settings_errors_do_not_fall_back_or_disclose_values() {
         let mut command = command();
         command.env("CLAUDE_PROXY__COPILOT_ROUTING", ROUTING);
         if let Some(value) = encrypted {
-            command.env("CLAUDE_PROXY_ENCRYPTED_CONFIG", value);
+            command.env("CLAUDE_PROXY_CONFIG", value);
         }
         if let Some(value) = secret {
-            command.env("CLAUDE_PROXY_CONFIG_KEY", value);
+            command.env("CLAUDE_PROXY_SECRET", value);
         }
         let output = command.output().unwrap();
         assert!(!output.status.success());
         let error = String::from_utf8(output.stderr).unwrap();
-        assert!(error.contains("Invalid encrypted proxy configuration"));
+        assert!(error.contains("configuration"));
         assert!(!error.contains("fixture-secret"));
         assert!(!error.contains(&key));
     }
@@ -136,4 +136,73 @@ fn malformed_environment_secret_fails_closed_without_echoing_credentials() {
     let error = String::from_utf8(output.stderr).unwrap();
     assert!(error.contains("Invalid copilot_routing JSON"));
     assert!(!error.contains("secret-value"));
+}
+
+#[test]
+fn plaintext_config_and_rust_encryption_cli_share_the_same_loader() {
+    let plaintext = r#"{"upstream_url":"http://127.0.0.1:1","copilot_pools":{"copilot-1":{"api_key":"fixture-client","github":[{"login":"alice","token":"fixture-token"}]}}}"#;
+    let mut plain = command();
+    plain.env("CLAUDE_PROXY_CONFIG", plaintext);
+    assert_authenticated_startup(plain);
+    let path = std::env::temp_dir().join(format!("proxy-cli-{}.json", uuid::Uuid::new_v4()));
+    let mut child = command()
+        .args(["--encrypt-config", path.to_str().unwrap()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(plaintext.as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    assert!(output.stdout.is_empty());
+    let settings: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let mut encrypted = command();
+    for name in ["CLAUDE_PROXY_CONFIG", "CLAUDE_PROXY_SECRET"] {
+        encrypted.env(name, settings[name].as_str().unwrap());
+    }
+    assert_authenticated_startup(encrypted);
+    std::fs::write(&path, settings["CLAUDE_PROXY_CONFIG"].as_str().unwrap()).unwrap();
+    let mut file = command();
+    file.args([
+        "--config",
+        path.to_str().unwrap(),
+        "--secret",
+        settings["CLAUDE_PROXY_SECRET"].as_str().unwrap(),
+    ]);
+    assert_authenticated_startup(file);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn malformed_plaintext_pools_never_disclose_credentials() {
+    let output = command().env("CLAUDE_PROXY_CONFIG", r#"{"copilot_pools":{"copilot-1":{"api_key":"fixture-key","github":"fixture-secret"}}}"#).output().unwrap();
+    assert!(!output.status.success());
+    let error = String::from_utf8(output.stderr).unwrap();
+    assert!(error.contains("Invalid proxy configuration"));
+    assert!(!error.contains("fixture-secret"));
+}
+
+#[test]
+fn copilot_source_requires_an_explicit_upstream_and_accepts_cli_override() {
+    let config = r#"{"copilot_pools":{"copilot-1":{"api_key":"fixture-client","github":[{"login":"alice","token":"fixture-token"}]}}}"#;
+    let output = command()
+        .env_remove("CLAUDE_PROXY__UPSTREAM_URL")
+        .env("CLAUDE_PROXY_CONFIG", config)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("upstream_url is required"));
+    let mut overridden = command();
+    overridden
+        .env_remove("CLAUDE_PROXY__UPSTREAM_URL")
+        .env("CLAUDE_PROXY_CONFIG", config)
+        .args(["--upstream-url", "http://127.0.0.1:1"]);
+    assert_authenticated_startup(overridden);
 }

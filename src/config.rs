@@ -97,9 +97,6 @@ pub struct ProxyConfig {
     pub copilot_routing: Option<crate::routing::CopilotRouting>,
 
     #[serde(default)]
-    pub copilot_vault_url: Option<String>,
-
-    #[serde(default)]
     pub copilot_pools: Option<crate::routing::CopilotPools>,
 
     /// Custom headers to add to upstream requests
@@ -328,22 +325,38 @@ pub enum TlsConfig {
 }
 
 impl ProxyConfig {
+    pub fn has_copilot_routes(&self) -> bool {
+        self.copilot_routing.is_some() || self.copilot_pools.is_some()
+    }
+
+    pub fn uses_copilot(&self) -> bool {
+        self.has_copilot_routes()
+            || matches!(self.upstream_auth, Some(UpstreamAuthConfig::Copilot { .. }))
+    }
+
+    pub fn validate_auth(&self) -> Result<(), &'static str> {
+        if self.uses_copilot() && self.upstream_url.trim().is_empty() {
+            return Err("Copilot requires an explicit upstream_url");
+        }
+        match (&self.copilot_pools, &self.copilot_routing) {
+            (Some(_), Some(_)) => Err("Configure only one Copilot routing source"),
+            (Some(pools), None) => {
+                pools.validate()?;
+                crate::routing::validate_headers(&self.upstream_headers)
+            }
+            (None, Some(routing)) => routing.validate(&self.upstream_headers),
+            (None, None)
+                if self.client_api_key.trim().is_empty() || self.upstream_auth.is_none() =>
+            {
+                Err("client_api_key and upstream_auth are required without Copilot routing")
+            }
+            (None, None) => Ok(()),
+        }
+    }
+
     #[allow(dead_code)]
     pub fn from_env() -> Result<Self, config::ConfigError> {
         let config = config::Config::builder()
-            .add_source(
-                config::Environment::default()
-                    .prefix("CLAUDE_PROXY")
-                    .separator("__"),
-            )
-            .build()?;
-
-        config.try_deserialize()
-    }
-
-    pub fn from_file(path: &str) -> Result<Self, config::ConfigError> {
-        let config = config::Config::builder()
-            .add_source(config::File::with_name(path))
             .add_source(
                 config::Environment::default()
                     .prefix("CLAUDE_PROXY")

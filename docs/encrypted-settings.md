@@ -1,7 +1,7 @@
 # Encrypted Container Apps settings
 
-The proxy can load its JSON configuration from `CLAUDE_PROXY_ENCRYPTED_CONFIG`
-and `CLAUDE_PROXY_CONFIG_KEY`. Configure both as Container Apps secrets and
+The proxy can load its JSON configuration from `CLAUDE_PROXY_CONFIG`
+and `CLAUDE_PROXY_SECRET`. Configure both as Container Apps secrets and
 reference them from environment variables. No Key Vault access is required.
 
 The envelope uses AES-256-GCM with a random 32-byte key, a random 12-byte nonce,
@@ -10,9 +10,13 @@ and the authenticated context `claude-proxy-config-v1`. Its format is
 Invalid, incomplete, or tampered settings prevent startup without logging values.
 This hides plaintext in settings. Anyone able to read both secrets can decrypt it.
 
-The encrypted document replaces the configuration file. Existing command-line
+When `CLAUDE_PROXY_SECRET` (or `--secret`) is present, config must be encrypted.
+Without a secret, config is plaintext JSON or TOML. There is no automatic fallback.
+`CLAUDE_PROXY_CONFIG` contains config directly. `--config FILE` takes precedence
+and reads the same plaintext or encrypted content from a file. Existing command-line
 and `CLAUDE_PROXY__*` environment overrides retain their precedence. Configure
-only one of `copilot_pools`, `copilot_routing`, and `copilot_vault_url`.
+only one of `copilot_pools` and `copilot_routing`. Set an explicit upstream URL
+for Copilot. Configuration is loaded once at startup, with no remote refresh.
 
 Example plaintext structure, using placeholders only:
 
@@ -37,9 +41,11 @@ Example plaintext structure, using placeholders only:
 }
 ```
 
-Use `tools/encrypt_config.py --output <private-settings.json>` with JSON on stdin
-and Python's `cryptography` package installed. The output is created with mode
-0600 and is never overwritten. Keep it outside Git and the Docker build context.
+Use `claude-proxy --encrypt-config <private-settings.json>` with JSON on stdin.
+The same Rust binary encrypts and decrypts. No Python dependency is needed.
+The output is created with mode 0600 on Unix and is never overwritten. On Windows,
+the file inherits the containing directory's ACL, so use a private directory.
+Keep it outside Git and the Docker build context.
 Upload the two values as separate app secrets. Deploy a new revision or restart
 the active revision after changing secrets. Pools load once per process.
 Preserve pool names to preserve the existing session hash. Single-member pools

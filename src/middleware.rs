@@ -5,10 +5,7 @@ use axum::{
     middleware::Next,
     response::Response,
 };
-use std::{
-    collections::HashMap,
-    sync::{Arc, RwLock as SyncRwLock},
-};
+use std::{collections::HashMap, sync::Arc};
 use tracing::{debug, warn};
 
 use crate::auth::{create_upstream_auth, CopilotAuth, UpstreamAuth};
@@ -17,8 +14,7 @@ use crate::config::ProxyConfig;
 /// State for API key validation middleware
 #[derive(Clone)]
 pub struct ApiKeyValidatorState {
-    clients: Arc<SyncRwLock<HashMap<String, Route>>>,
-    tokens: Arc<SyncRwLock<HashMap<String, Arc<dyn UpstreamAuth>>>>,
+    clients: Arc<HashMap<String, Route>>,
     allow_missing_key: bool,
 }
 
@@ -91,139 +87,70 @@ fn session_id(headers: &HeaderMap) -> Result<Option<&str>, StatusCode> {
 }
 
 impl ApiKeyValidatorState {
-    pub fn validate_config(config: &ProxyConfig) -> Result<(), &'static str> {
-        if [
-            config.copilot_vault_url.is_some(),
-            config.copilot_routing.is_some(),
-            config.copilot_pools.is_some(),
-        ]
-        .into_iter()
-        .filter(|configured| *configured)
-        .count()
-            > 1
-        {
-            return Err("Configure only one Copilot routing source");
-        }
-        if let Some(pools) = &config.copilot_pools {
-            pools.validate()?;
-            return crate::routing::validate_headers(&config.upstream_headers);
-        }
-        if let Some(url) = &config.copilot_vault_url {
-            crate::keyvault::validate_vault_url(url)?;
-            crate::routing::validate_headers(&config.upstream_headers)
-        } else if let Some(routing) = &config.copilot_routing {
-            routing.validate(&config.upstream_headers)
-        } else if config.client_api_key.trim().is_empty() || config.upstream_auth.is_none() {
-            Err("client_api_key and upstream_auth are required without copilot_routing")
-        } else {
-            Ok(())
-        }
-    }
-
     pub fn from_config(config: &ProxyConfig) -> Result<Self, &'static str> {
-        Self::validate_config(config)?;
-        let state = Self {
-            clients: Arc::new(SyncRwLock::new(HashMap::new())),
-            tokens: Arc::new(SyncRwLock::new(HashMap::new())),
-            allow_missing_key: config.copilot_routing.is_none()
-                && config.copilot_pools.is_none()
-                && config.copilot_vault_url.is_none(),
+        config.validate_auth()?;
+        let mut tokens: HashMap<String, Arc<dyn UpstreamAuth>> = HashMap::new();
+        let mut copilot = |token: &str| {
+            tokens
+                .entry(token.to_owned())
+                .or_insert_with(|| Arc::new(CopilotAuth::new(token.to_owned())))
+                .clone()
         };
-        if let Some(pools) = &config.copilot_pools {
-            state.replace_records(&pools.0)?;
+        let clients = if let Some(pools) = &config.copilot_pools {
+            pools
+                .0
+                .iter()
+                .map(|(name, pool)| {
+                    (
+                        pool.api_key.clone(),
+                        Route {
+                            name: name.clone(),
+                            members: pool
+                                .github
+                                .iter()
+                                .map(|account| {
+                                    (account.login.to_ascii_lowercase(), copilot(&account.token))
+                                })
+                                .collect(),
+                        },
+                    )
+                })
+                .collect()
         } else if let Some(routing) = &config.copilot_routing {
-            state.replace_copilot(routing)?;
-        } else if config.copilot_vault_url.is_none() {
-            let auth = create_upstream_auth(config.upstream_auth.as_ref().unwrap());
-            state
+            let accounts: HashMap<_, _> = routing
+                .accounts
+                .iter()
+                .map(|account| (&account.name, copilot(&account.github_token)))
+                .collect();
+            routing
                 .clients
-                .write()
-                .map_err(|_| "Routing lock failed")?
-                .insert(config.client_api_key.clone(), Route::single(auth));
-        }
-        Ok(state)
+                .iter()
+                .map(|client| {
+                    (
+                        client.api_key.clone(),
+                        Route::single(accounts[&client.account].clone()),
+                    )
+                })
+                .collect()
+        } else {
+            HashMap::from([(
+                config.client_api_key.clone(),
+                Route::single(create_upstream_auth(config.upstream_auth.as_ref().unwrap())),
+            )])
+        };
+        Ok(Self {
+            clients: Arc::new(clients),
+            allow_missing_key: !config.has_copilot_routes(),
+        })
     }
 
     #[cfg(test)]
     pub fn lookup(&self, key: &str) -> Option<Arc<dyn UpstreamAuth>> {
         self.clients
-            .read()
-            .ok()?
             .get(key)?
             .members
             .first()
             .map(|(_, auth)| auth.clone())
-    }
-
-    pub fn replace_records(
-        &self,
-        records: &HashMap<String, crate::routing::VaultRecord>,
-    ) -> Result<(), &'static str> {
-        let mut previous = self.tokens.write().map_err(|_| "Routing lock failed")?;
-        let mut tokens = HashMap::new();
-        let mut clients = HashMap::new();
-        for (name, record) in records {
-            if !record.validate() || clients.contains_key(&record.api_key) {
-                return Err("Invalid Vault routing");
-            }
-            let mut members = Vec::new();
-            for account in &record.github {
-                let auth = tokens.entry(account.token.clone()).or_insert_with(|| {
-                    previous
-                        .get(&account.token)
-                        .cloned()
-                        .unwrap_or_else(|| Arc::new(CopilotAuth::new(account.token.clone())))
-                });
-                members.push((account.login.to_ascii_lowercase(), auth.clone()));
-            }
-            clients.insert(
-                record.api_key.clone(),
-                Route {
-                    name: name.clone(),
-                    members,
-                },
-            );
-        }
-        *self.clients.write().map_err(|_| "Routing lock failed")? = clients;
-        *previous = tokens;
-        Ok(())
-    }
-
-    pub fn replace_copilot(
-        &self,
-        routing: &crate::routing::CopilotRouting,
-    ) -> Result<(), &'static str> {
-        if !routing.accounts.is_empty() || !routing.clients.is_empty() {
-            routing.validate(&[])?;
-        }
-        let mut previous = self.tokens.write().map_err(|_| "Routing lock failed")?;
-        let mut tokens = HashMap::new();
-        let mut accounts = HashMap::new();
-        for account in &routing.accounts {
-            let auth = tokens
-                .entry(account.github_token.clone())
-                .or_insert_with(|| {
-                    previous
-                        .get(&account.github_token)
-                        .cloned()
-                        .unwrap_or_else(|| Arc::new(CopilotAuth::new(account.github_token.clone())))
-                });
-            accounts.insert(&account.name, auth.clone());
-        }
-        let clients = routing
-            .clients
-            .iter()
-            .map(|client| {
-                (
-                    client.api_key.clone(),
-                    Route::single(accounts[&client.account].clone()),
-                )
-            })
-            .collect();
-        // Publish the complete map once. In-flight requests retain their selected Arc.
-        *self.clients.write().map_err(|_| "Routing lock failed")? = clients;
-        *previous = tokens;
-        Ok(())
     }
 }
 
@@ -256,7 +183,7 @@ pub async fn validate_client_api_key(
 
     let route = api_key
         .as_deref()
-        .and_then(|key| state.clients.read().ok()?.get(key).cloned());
+        .and_then(|key| state.clients.get(key).cloned());
     let selected = route
         .map(|route| route.select(request.headers(), request.method(), request.uri().path()))
         .transpose()?;
@@ -307,29 +234,49 @@ mod tests {
                     {"login":"bob", "token":"fixture-token-two"}
                 ]}
             }
-        })).unwrap();
+        }))
+        .unwrap();
         let state = ApiKeyValidatorState::from_config(&config).unwrap();
         assert!(!state.allow_missing_key);
-        let clients = state.clients.read().unwrap();
+        let clients = state.clients.as_ref();
         assert_eq!(clients["fixture-pool"].name, "copilot-5");
         assert_eq!(clients["fixture-pool"].members.len(), 2);
-        assert!(Arc::ptr_eq(&clients["fixture-client"].members[0].1, &clients["fixture-pool"].members[0].1));
+        assert!(Arc::ptr_eq(
+            &clients["fixture-client"].members[0].1,
+            &clients["fixture-pool"].members[0].1
+        ));
         let mut headers = HeaderMap::new();
-        assert!(clients["fixture-pool"].select(&headers, &Method::POST, "/responses").is_err());
+        assert!(clients["fixture-pool"]
+            .select(&headers, &Method::POST, "/responses")
+            .is_err());
         headers.insert("session-id", "session-one".parse().unwrap());
-        let first = clients["fixture-pool"].select(&headers, &Method::POST, "/responses").unwrap();
+        let first = clients["fixture-pool"]
+            .select(&headers, &Method::POST, "/responses")
+            .unwrap();
         let restarted = ApiKeyValidatorState::from_config(&config).unwrap();
-        let restarted_clients = restarted.clients.read().unwrap();
-        let selected = restarted_clients["fixture-pool"].select(&headers, &Method::POST, "/responses").unwrap();
-        let login = |route: &Route, auth: &Arc<dyn UpstreamAuth>| route.members.iter().find(|(_, a)| Arc::ptr_eq(a, auth)).unwrap().0.clone();
-        assert_eq!(login(&clients["fixture-pool"], &first), login(&restarted_clients["fixture-pool"], &selected));
+        let restarted_clients = restarted.clients.as_ref();
+        let selected = restarted_clients["fixture-pool"]
+            .select(&headers, &Method::POST, "/responses")
+            .unwrap();
+        let login = |route: &Route, auth: &Arc<dyn UpstreamAuth>| {
+            route
+                .members
+                .iter()
+                .find(|(_, a)| Arc::ptr_eq(a, auth))
+                .unwrap()
+                .0
+                .clone()
+        };
+        assert_eq!(
+            login(&clients["fixture-pool"], &first),
+            login(&restarted_clients["fixture-pool"], &selected)
+        );
         config.copilot_routing = Some(routing());
         assert!(ApiKeyValidatorState::from_config(&config).is_err());
         config.copilot_routing = None;
-        config.copilot_vault_url = Some("https://fixture.vault.azure.net/".into());
-        assert!(ApiKeyValidatorState::from_config(&config).is_err());
-        config.copilot_vault_url = None;
-        config.upstream_headers.push(("Authorization".into(), "fixture-secret".into()));
+        config
+            .upstream_headers
+            .push(("Authorization".into(), "fixture-secret".into()));
         assert!(ApiKeyValidatorState::from_config(&config).is_err());
     }
 
@@ -371,12 +318,11 @@ mod tests {
         let one: Arc<dyn UpstreamAuth> = Arc::new(BearerAuth::new("upstream-one".into()));
         let two: Arc<dyn UpstreamAuth> = Arc::new(BearerAuth::new("upstream-two".into()));
         ApiKeyValidatorState {
-            clients: Arc::new(SyncRwLock::new(HashMap::from([
+            clients: Arc::new(HashMap::from([
                 ("client-one".into(), Route::single(one.clone())),
                 ("client-shared".into(), Route::single(one)),
                 ("client-two".into(), Route::single(two)),
-            ]))),
-            tokens: Arc::new(SyncRwLock::new(HashMap::new())),
+            ])),
             allow_missing_key,
         }
     }
@@ -536,11 +482,8 @@ mod tests {
     #[tokio::test]
     async fn token_exchange_failure_does_not_use_another_account() {
         let (url, calls, server) = upstream().await;
-        let state = state(false);
-        state
-            .clients
-            .write()
-            .unwrap()
+        let mut state = state(false);
+        Arc::make_mut(&mut state.clients)
             .insert("client-one".into(), Route::single(Arc::new(FailedAuth)));
         let response = app(state, url)
             .oneshot(
@@ -654,30 +597,17 @@ mod tests {
     }
 
     #[test]
-    fn invalid_pool_refresh_is_atomic() {
-        let state = state(false);
-        let mut records = HashMap::new();
-        let good: crate::routing::VaultRecord = serde_json::from_value(serde_json::json!({"api_key":"new-key","github":[{"login":"alice","token":"fixture-token"},{"login":"bob","token":"fixture-bob"}]})).unwrap();
-        records.insert("copilot-5".into(), good.clone());
-        state.replace_records(&records).unwrap();
-        let before = state.lookup("new-key").unwrap();
-        records.get_mut("copilot-5").unwrap().github[0].token = "rotated-token".into();
-        state.replace_records(&records).unwrap();
-        assert!(!Arc::ptr_eq(&before, &state.lookup("new-key").unwrap()));
-        records.insert("copilot-6".into(), good.clone());
-        assert!(state.replace_records(&records).is_err());
-        assert!(state.lookup("new-key").is_some());
+    fn rejects_invalid_pool_members_and_policies() {
+        let good: crate::routing::CopilotPool = serde_json::from_value(serde_json::json!({"api_key":"new-key","github":[{"login":"alice","token":"fixture-token"},{"login":"bob","token":"fixture-bob"}]})).unwrap();
         for mutate in [
-            |r: &mut crate::routing::VaultRecord| r.policy = "most_remaining".into(),
-            |r: &mut crate::routing::VaultRecord| r.github.clear(),
-            |r: &mut crate::routing::VaultRecord| r.github[1].login = "ALICE".into(),
-            |r: &mut crate::routing::VaultRecord| r.github[0].token = "bad token".into(),
+            |r: &mut crate::routing::CopilotPool| r.policy = "most_remaining".into(),
+            |r: &mut crate::routing::CopilotPool| r.github.clear(),
+            |r: &mut crate::routing::CopilotPool| r.github[1].login = "ALICE".into(),
+            |r: &mut crate::routing::CopilotPool| r.github[0].token = "bad token".into(),
         ] {
             let mut record = good.clone();
             mutate(&mut record);
             assert!(!record.validate());
         }
-        state.replace_records(&HashMap::new()).unwrap();
-        assert!(state.lookup("new-key").is_none());
     }
 }

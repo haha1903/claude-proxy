@@ -17,7 +17,6 @@ import urllib.request
 from zoneinfo import ZoneInfo
 
 
-CONFIG = Path.home() / ".config/claude-proxy/copilot-accounts.json"
 API_ORIGIN = "https://api.github.com"
 TIMEOUT = 25
 MAX_RESPONSE_BYTES = 1024 * 1024
@@ -281,9 +280,8 @@ def collect_vault():
 
 
 def collect(path=None):
-    if path is None and (Path.home() / ".config/claude-proxy/key-vault.json").exists():
+    if path is None:
         return collect_vault()
-    path = path or CONFIG
     started = time.monotonic()
     try:
         accounts = load_accounts(path)

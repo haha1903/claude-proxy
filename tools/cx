@@ -209,6 +209,10 @@ def switch_config(path, original, config, mode, selection):
     if (selection or mode == "sync") and not entry.get("base_url"):
         raise ConfigError("Missing model_providers.copilot-proxy configuration.")
     label = PROXIES[selection][0] if selection else None
+    if mode == "sync":
+        default_entry = "copilot1" if provider == PROXY else provider
+        if re.fullmatch(r"copilot[1-9][0-9]*", default_entry) and default_entry not in PROXIES:
+            print(f"Default provider {provider} is absent from synchronized entries. Select an available provider before starting a new chat.", file=sys.stderr)
 
     source = original.decode()
     first_table = re.search(r"(?m)^[ \t]*\[", source)
@@ -230,7 +234,10 @@ def switch_config(path, original, config, mode, selection):
     if not valid:
         raise ConfigError("Validation failed: unrelated configuration would change.")
     if updated == original:
-        print(f"Already using {provider}" + (f" / {label}" if selection else "") + f" / {MODEL}.")
+        if mode == "sync":
+            print("Copilot providers already match the synchronized cache. Defaults unchanged.")
+        else:
+            print(f"Already using {provider}" + (f" / {label}" if selection else "") + f" / {MODEL}.")
         return
     if path.read_bytes() != original:
         raise ConfigError("Codex configuration changed while selecting. Run cx again.")

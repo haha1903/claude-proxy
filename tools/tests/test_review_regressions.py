@@ -65,3 +65,33 @@ class ReviewRegressions(unittest.TestCase):
             for data in [{}, {'schema_version':2,'entries':[]},{'schema_version':1,'entries':{}},{'schema_version':1,'entries':[{'number':True,'api_key':'key'}]},{'schema_version':1,'entries':[{'number':1,'api_key':'bad key'}]},{'schema_version':1,'entries':[{'number':1,'api_key':'key'},{'number':2,'api_key':'key'}]}]:
                 path.write_text(json.dumps(data))
                 with self.assertRaises(cx.ConfigError):cx.discover()
+
+
+    def test_sync_noop_reports_actual_semantics_and_missing_default(self):
+        from unittest.mock import Mock
+        with tempfile.TemporaryDirectory() as temp,patch.object(Path,'home',return_value=Path(temp)),patch.object(cx,'PROXIES',cx.PROXIES.copy()),patch.object(cx,'ALIASES',cx.ALIASES.copy()),patch.object(cx,'VAULT_KEYS',None):
+            home=Path(temp);(home/'.codex').mkdir()
+            config=home/'.codex/config.toml'
+            config.write_text('model_provider = "copilot3"\nmodel = "custom-model"\n[model_providers.copilot-proxy]\nbase_url = "https://fixture.invalid"\nname = "Copilot 1"\nexperimental_bearer_token = "old-client-key"\n')
+            loader=Mock();loader.load_records.return_value={'records':[{'number':1,'api_key':'key-one'},{'number':3,'api_key':'key-three'}],'errors':[]}
+            output,error=io.StringIO(),io.StringIO()
+            with patch.object(cx,'vault_loader',return_value=loader),contextlib.redirect_stdout(output),contextlib.redirect_stderr(error):
+                self.assertEqual(cx.main(['sync']),0)
+                output.seek(0);output.truncate(0)
+                self.assertEqual(cx.main(['sync']),0)
+                self.assertIn('Defaults unchanged',output.getvalue())
+                self.assertNotIn('gpt-6-astra',output.getvalue())
+                loader.load_records.return_value['records']=[{'number':1,'api_key':'key-one'}]
+                self.assertEqual(cx.main(['sync']),0)
+                self.assertIn('copilot3 is absent',error.getvalue())
+                self.assertEqual(cx.tomllib.loads(config.read_text())['model_provider'],'copilot3')
+
+    def test_missing_vault_configuration_does_not_restore_legacy_identities(self):
+        import check_usage as usage
+        from unittest.mock import Mock
+        loader=Mock();loader.load_records.side_effect=v.VaultError('vault_config_invalid')
+        with patch.object(usage,'vault_loader',return_value=loader),patch.object(usage,'load_accounts',side_effect=AssertionError('No legacy fallback')):
+            report=usage.collect()
+        self.assertFalse(report['ok'])
+        self.assertEqual(report['accounts'],[])
+        self.assertEqual(report['discovery_errors'],[{'code':'vault_config_invalid'}])

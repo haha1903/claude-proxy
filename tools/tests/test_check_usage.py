@@ -18,7 +18,6 @@ SCRIPT = Path(__file__).resolve().parents[1] / "check_usage.py"
 SPEC = importlib.util.spec_from_file_location("check_usage", SCRIPT)
 usage = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(usage)
-REVIEW = Path.home() / "tmp/review/copilot-usage"
 
 
 def config_data():
@@ -54,8 +53,7 @@ def response_data(login="haha1903"):
 
 class CoreTests(unittest.TestCase):
     def setUp(self):
-        REVIEW.mkdir(parents=True, exist_ok=True)
-        self.temp = tempfile.TemporaryDirectory(dir=REVIEW)
+        self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.config = Path(self.temp.name) / "accounts.json"
         self.config.write_text(json.dumps(config_data()))
@@ -343,8 +341,10 @@ class HttpIntegrationTests(unittest.TestCase):
                     del data["login"]
             return 200, json.dumps(data).encode(), {}
         type(self).dispatch = staticmethod(dispatch)
-        with patch.object(usage, "load_accounts", return_value=list(config_data()["accounts"].values())):
-            report = usage.collect()
+        with patch.object(usage, "load_accounts", return_value=list(config_data()["accounts"].values())), \
+             patch.object(Path, "exists", return_value=True), \
+             patch.object(usage, "vault_loader", side_effect=AssertionError("Real Vault access forbidden in fixture")):
+            report = usage.collect(Path("fixture-accounts.json"))
         self.assertTrue(report["ok"])
         self.assertEqual([a["name"] for a in report["accounts"]], ["Copilot 1", "Copilot 2", "Copilot 3"])
         self.assertEqual([a["login"] for a in report["accounts"]],

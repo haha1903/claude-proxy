@@ -122,6 +122,13 @@ def parse_record(name, secret):
         raise VaultError("vault_record_invalid") from None
 
 
+def same_origin(url, origin):
+    base = urllib.parse.urlsplit(origin)
+    return (url.username is None and url.password is None
+            and url.scheme == base.scheme and url.hostname == base.hostname
+            and (url.port or 443) == (base.port or 443))
+
+
 def load_records(path=None):
     origin, subscription = configuration(path)
     token = azure_token(subscription)
@@ -130,7 +137,7 @@ def load_records(path=None):
     try:
         while next_url:
             url = urllib.parse.urlsplit(next_url)
-            if (url.scheme + "://" + url.netloc != origin or url.path != "/secrets"
+            if (not same_origin(url, origin) or url.path != "/secrets"
                     or url.fragment or next_url in visited or len(visited) >= 100):
                 raise VaultError("vault_continuation_invalid")
             visited.add(next_url)
@@ -139,7 +146,7 @@ def load_records(path=None):
                 raise ValueError()
             for item in page["value"]:
                 identifier = urllib.parse.urlsplit(item["id"])
-                if identifier.scheme + "://" + identifier.netloc != origin:
+                if not same_origin(identifier, origin):
                     raise VaultError("vault_secret_origin_invalid")
                 name = identifier.path.removeprefix("/secrets/")
                 if re.fullmatch(r"copilot-[1-9][0-9]*", name) and int(name[8:]) <= 4294967295:

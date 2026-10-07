@@ -43,8 +43,10 @@ routing. Single-account records do not require session headers.
 Local tools use Azure CLI authentication and a nonsecret file at
 `~/.config/claude-proxy/key-vault.json` with `vault_url` and `subscription`.
 Install `copilot_vault.py` at `~/.local/lib/copilot-vault/copilot_vault.py`.
-`cx` discovers records when invoked and updates local Codex provider keys when
-switching. Codex still stores the selected client credentials locally.
+`cx sync` explicitly reads Vault and refreshes the local client-key cache and
+Codex provider keys, preserving the selected provider, model and effort. The menu
+and switching read the cache without network calls. There is no background sync.
+GitHub tokens are not cached. Codex still stores client credentials locally.
 `check_usage.py --json` reports every discovered account, deduplicating identical
 login/token pairs across pools. Different credentials for one login are verified
 separately. Vault failures are reported without falling back to local credentials.
